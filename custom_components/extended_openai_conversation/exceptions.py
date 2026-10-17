@@ -91,17 +91,24 @@ class FunctionLoadFailed(HomeAssistantError):
 class ParseArgumentsFailed(HomeAssistantError):
     """When parse arguments failed."""
 
-    def __init__(self, arguments: str) -> None:
-        """Initialize error."""
+    def __init__(
+        self,
+        arguments: str,
+        *,
+        tool_index: int | None = None,
+        position: int | None = None,
+        finish_reason: str | None = None,
+        reason: str = "invalid_json",
+    ) -> None:
+        """Keep diagnostics without retaining sensitive model-generated values."""
         super().__init__(
-            self,
-            f"failed to parse arguments `{arguments}`. Increase maximum token to avoid the issue.",
+            "Tool call arguments were incomplete or invalid. Please try again."
         )
-        self.arguments = arguments
-
-    def __str__(self) -> str:
-        """Return string representation."""
-        return f"failed to parse arguments `{self.arguments}`. Increase maximum token to avoid the issue."
+        self.arguments_length = len(arguments)
+        self.tool_index = tool_index
+        self.position = position
+        self.finish_reason = finish_reason
+        self.reason = reason
 
 
 class TokenLengthExceededError(HomeAssistantError):
