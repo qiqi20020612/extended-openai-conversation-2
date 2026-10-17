@@ -149,11 +149,12 @@ class ExtendedOpenAIAgentEntity(
                 llm_context=llm_context,
             )
         except OpenAIError as err:
-            _LOGGER.error(err)
+            # API-compatible backends may echo arguments in an error body.
+            _LOGGER.error("OpenAI request failed (%s)", type(err).__name__)
             intent_response = intent.IntentResponse(language=user_input.language)
             intent_response.async_set_error(
                 intent.IntentResponseErrorCode.UNKNOWN,
-                f"Sorry, I had a problem talking to OpenAI: {err}",
+                f"Sorry, I had a problem talking to OpenAI ({type(err).__name__}).",
             )
             return conversation.ConversationResult(
                 response=intent_response, conversation_id=user_input.conversation_id
