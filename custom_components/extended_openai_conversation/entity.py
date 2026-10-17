@@ -66,7 +66,7 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Max number of back and forth with the LLM to generate a response
+# Internal tool-round limit, including malformed calls. Allow a final text reply.
 MAX_TOOL_ITERATIONS = 20
 
 _NATIVE_TOOL_CALL_EXTRA_CONTENT_KEY = "tool_call_extra_content_by_id"
@@ -82,6 +82,7 @@ class _ToolCallResponse:
     errors: dict[int, dict[str, str]] = field(default_factory=dict, repr=False)
     content: str = field(default="", repr=False)
     complete: bool = False
+    has_tool_calls: bool = False
 
 
 def _tool_call_key(tool_input: llm.ToolInput) -> tuple[str, str]:
@@ -541,86 +542,100 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             tool_kwargs["tools"] = tools
             tool_kwargs["tool_choice"] = "auto"
 
-        # One correction budget per user turn, shared across all tool iterations.
-        argument_retry_used = False
+        # Valid and invalid tool-call responses share the configured budget.
+        # Even an unlimited configuration remains bounded by the internal cap.
+        tool_round_limit = (
+            MAX_TOOL_ITERATIONS
+            if max_function_calls < 0
+            else min(max_function_calls, MAX_TOOL_ITERATIONS)
+        )
+        tool_rounds = 0
         completed_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
         completed_ids: dict[str, tuple[str, str]] = {}
+        retrying = False
+        replay_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
+        request_messages = messages
 
-        # To prevent infinite loops, we limit the number of iterations
-        for n_requests in range(MAX_TOOL_ITERATIONS):
-            # Update tool_choice based on function call count
-            # -1 means unlimited function calls
-            if tools and 0 <= max_function_calls <= n_requests:
-                tool_kwargs["tool_choice"] = "none"
-
-            request_messages = messages
+        # Reserve one response for final text after the last successful tool round.
+        for n_requests in range(MAX_TOOL_ITERATIONS + 1):
+            tools_allowed = bool(tools) and tool_rounds < tool_round_limit
+            if tools:
+                tool_kwargs["tool_choice"] = "auto" if tools_allowed else "none"
             history_before_request = chat_log.content.copy()
-            retrying = False
-            replay_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
-
-            while True:
-                _LOGGER.debug(
-                    "Requesting response (iteration=%s, correction=%s, messages=%s)",
-                    n_requests + 1,
-                    retrying,
-                    len(request_messages),
-                )
-                stream = await self._client.chat.completions.create(
-                    messages=request_messages,
-                    **api_kwargs,
-                    **tool_kwargs,
-                )
-                pending_tool_calls: list[llm.ToolInput] = []
-                response = _ToolCallResponse()
+            _LOGGER.debug(
+                "Requesting response (iteration=%s, correction=%s, messages=%s)",
+                n_requests + 1,
+                retrying,
+                len(request_messages),
+            )
+            stream = await self._client.chat.completions.create(
+                messages=request_messages,
+                **api_kwargs,
+                **tool_kwargs,
+            )
+            pending_tool_calls: list[llm.ToolInput] = []
+            response = _ToolCallResponse()
+            try:
                 try:
-                    try:
-                        deltas = (
-                            self._validated_retry_stream(
-                                chat_log, stream, completed_ids, response
-                            )
-                            if retrying
-                            else self._transform_stream(chat_log, stream, response)
+                    deltas = (
+                        self._validated_retry_stream(
+                            chat_log, stream, completed_ids, response
                         )
-                        async for content in chat_log.async_add_delta_content_stream(
-                            self.entity_id, deltas
-                        ):
-                            if (
-                                isinstance(content, conversation.AssistantContent)
-                                and content.tool_calls
-                            ):
-                                pending_tool_calls.extend(content.tool_calls)
-                    finally:
-                        await stream.close()
-                except ParseArgumentsFailed as err:
-                    # HA may have streamed text, but no tool in this response has
-                    # run. Restore only this request's checkpoint, never the turn.
-                    chat_log.content[:] = history_before_request
-                    _LOGGER.warning(
-                        "Invalid tool arguments (iteration=%s, retry_used=%s, "
-                        "reason=%s, tool_index=%s, arguments_length=%s, "
-                        "position=%s, finish_reason=%s)",
-                        n_requests + 1,
-                        argument_retry_used,
-                        err.reason,
-                        err.tool_index,
-                        err.arguments_length,
-                        err.position,
-                        err.finish_reason,
+                        if retrying
+                        else self._transform_stream(chat_log, stream, response)
                     )
-                    if argument_retry_used or not tools:
-                        raise
-                    argument_retry_used = True
-                    retrying = True
-                    replay_results = completed_results.copy()
-                    # Use only actual parser/validator output. If the wire call
-                    # is incomplete, replay the clean checkpoint without prompts
-                    # or fabricated tool IDs/results. This consumes the same budget.
-                    request_messages = [
-                        *messages,
-                        *_tool_error_messages(response, shorten_tool_call_id),
-                    ]
-                    continue
-                break
+                    async for content in chat_log.async_add_delta_content_stream(
+                        self.entity_id, deltas
+                    ):
+                        if (
+                            isinstance(content, conversation.AssistantContent)
+                            and content.tool_calls
+                        ):
+                            pending_tool_calls.extend(content.tool_calls)
+                    if response.has_tool_calls and not tools_allowed:
+                        # Some compatible backends ignore tool_choice="none".
+                        # Do not commit or execute calls beyond the shared limit.
+                        chat_log.content[:] = history_before_request
+                        raise HomeAssistantError("Tool call limit reached")
+                finally:
+                    # Count a response once, even for multiple calls, invalid
+                    # JSON, missing identities or an unfinished argument stream.
+                    if response.has_tool_calls:
+                        tool_rounds += 1
+                    await stream.close()
+            except ParseArgumentsFailed as err:
+                # HA may have streamed text, but no tool in this response has
+                # run. Restore only this request's checkpoint, never the turn.
+                chat_log.content[:] = history_before_request
+                _LOGGER.warning(
+                    "Invalid tool arguments (iteration=%s, tool_rounds=%s, "
+                    "tool_limit=%s, reason=%s, tool_index=%s, arguments_length=%s, "
+                    "position=%s, finish_reason=%s)",
+                    n_requests + 1,
+                    tool_rounds,
+                    tool_round_limit,
+                    err.reason,
+                    err.tool_index,
+                    err.arguments_length,
+                    err.position,
+                    err.finish_reason,
+                )
+                if (
+                    not tools_allowed
+                    or not response.has_tool_calls
+                    or tool_rounds >= tool_round_limit
+                ):
+                    raise
+                retrying = True
+                replay_results = completed_results.copy()
+                # Use only actual parser/validator output. If the wire call is
+                # incomplete, replay the clean checkpoint without prompts or
+                # fabricated tool IDs/results. Both paths use the shared budget.
+                request_messages = [
+                    *messages,
+                    *_tool_error_messages(response, shorten_tool_call_id),
+                ]
+                continue
 
             if retrying:
                 _LOGGER.debug("Tool argument correction succeeded")
@@ -675,6 +690,9 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             # Check if we need to continue (if there are pending tool results)
             if not chat_log.unresponded_tool_results:
                 break
+            retrying = False
+            replay_results = {}
+            request_messages = messages
 
     async def _validated_retry_stream(
         self,
@@ -768,6 +786,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     yield {"content": content_value}
 
             if delta.tool_calls:
+                response.has_tool_calls = True
                 for tool_call_delta in delta.tool_calls:
                     idx = tool_call_delta.index
                     if idx not in current_tool_calls:

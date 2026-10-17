@@ -15,6 +15,7 @@ from custom_components.extended_openai_conversation.conversation import (
     ExtendedOpenAIAgentEntity,
 )
 from custom_components.extended_openai_conversation.entity import (
+    MAX_TOOL_ITERATIONS,
     ExtendedOpenAIBaseLLMEntity,
     _make_tool_result_content,
     _shorten_tool_call_id,
@@ -163,7 +164,11 @@ async def test_interleaved_argument_fragments_are_not_parsed_early(hass, finish)
             finish=finish,
         ),
     )
-    entity, log, create = _setup(hass, [stream, _answer()])
+    entity, log, create = _setup(
+        hass,
+        [stream, _answer()],
+        options={"max_function_calls_per_conversation": 1},
+    )
 
     await _run(entity, log)
 
@@ -174,13 +179,18 @@ async def test_interleaved_argument_fragments_are_not_parsed_early(hass, finish)
         {"a": 1},
         {"b": 2},
     ]
+    assert [c.kwargs["tool_choice"] for c in create.await_args_list] == ["auto", "none"]
 
 
 @pytest.mark.parametrize("arguments", ['{"value":', "", "null", "[]", '"text"'])
-async def test_invalid_arguments_are_regenerated_once(hass, arguments):
+async def test_invalid_arguments_use_parser_feedback(hass, arguments):
     failed = _calls(_tool(arguments))
     repaired = _calls(_tool('{"value":1}', call_id="repaired"))
-    entity, log, create = _setup(hass, [failed, repaired, _answer()])
+    entity, log, create = _setup(
+        hass,
+        [failed, repaired, _answer()],
+        options={"max_function_calls_per_conversation": 2},
+    )
 
     await _run(entity, log)
 
@@ -228,7 +238,11 @@ async def test_failed_stream_executes_no_partial_batch(hass, separate_batches):
         _tool('{"value":1}', call_id="new_one"),
         _tool('{"value":2}', index=1, call_id="new_two"),
     )
-    entity, log, create = _setup(hass, [failed, repaired, _answer()])
+    entity, log, create = _setup(
+        hass,
+        [failed, repaired, _answer()],
+        options={"max_function_calls_per_conversation": 2},
+    )
     responses = iter([failed, repaired, _answer()])
 
     async def respond(**kwargs):
@@ -245,6 +259,11 @@ async def test_failed_stream_executes_no_partial_batch(hass, separate_batches):
         "new_two",
     ]
     assert len(_results(log)) == 2
+    assert [c.kwargs["tool_choice"] for c in create.await_args_list] == [
+        "auto",
+        "auto",
+        "none",
+    ]
     feedback = create.await_args_list[1].kwargs["messages"][2:]
     assert [m["role"] for m in feedback] == ["assistant", "tool", "tool"]
     assert json.loads(feedback[1]["content"]) == {"status": "not_executed"}
@@ -354,19 +373,246 @@ async def test_correction_does_not_schedule_completed_background_tool_again(
     assert _tool_result_data(_results(log)[1]) == {"result": "Scheduled"}
 
 
-async def test_retry_budget_is_shared_across_iterations(hass):
-    streams = [_calls(_tool("{")), _calls(_tool("{}")), _calls(_tool("{"))]
-    entity, log, create = _setup(hass, streams)
+@pytest.mark.parametrize("limit", [1, 2, 3, 10, -1])
+@pytest.mark.parametrize("failure", ["json", "validator", "missing_id", "eof"])
+async def test_corrections_share_tool_round_limit_and_allow_final_text(
+    hass, limit, failure
+):
+    rounds = limit if limit >= 0 else MAX_TOOL_ITERATIONS
+    failures = [
+        _calls(
+            _tool(
+                "[]" if failure == "validator" else "{",
+                call_id=None if failure == "missing_id" else f"failed_{index}",
+            ),
+            finish=None if failure == "eof" else "tool_calls",
+        )
+        for index in range(rounds - 1)
+    ]
+    streams = [*failures, _calls(_tool("{}", call_id="valid")), _answer()]
+    entity, log, create = _setup(
+        hass, streams, options={"max_function_calls_per_conversation": limit}
+    )
+
+    await _run(entity, log)
+
+    assert create.await_count == rounds + 1
+    entity._execute_function_tool.assert_awaited_once()
+    assert entity._execute_function_tool.await_args.args[1].id == "valid"
+    assert [c.kwargs["tool_choice"] for c in create.await_args_list] == [
+        *(["auto"] * rounds),
+        "none",
+    ]
+    original = create.await_args_list[0].kwargs["messages"]
+    for index, request in enumerate(create.await_args_list[1:rounds], start=1):
+        messages = request.kwargs["messages"]
+        _assert_paired_tools(messages)
+        if failure in {"missing_id", "eof"}:
+            assert messages == original
+        else:
+            assert messages[: len(original)] == original
+            assert [m["role"] for m in messages[len(original) :]] == [
+                "assistant",
+                "tool",
+            ]
+            assert messages[-1]["tool_call_id"] == f"failed_{index - 1}"
+    assert [r.tool_call_id for r in _results(log)] == ["valid"]
+    assert log.content[-1].content == "Finished."
+    assert not log.unresponded_tool_results
+    for stream in streams:
+        stream.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 10, -1, MAX_TOOL_ITERATIONS + 10])
+@pytest.mark.parametrize("failure", ["json", "validator", "missing_id", "eof"])
+async def test_exhausted_tool_round_limit_stops_invalid_arguments(hass, limit, failure):
+    rounds = min(limit, MAX_TOOL_ITERATIONS) if limit >= 0 else MAX_TOOL_ITERATIONS
+    streams = [
+        _calls(
+            _tool(
+                "[]" if failure == "validator" else "{",
+                call_id=None if failure == "missing_id" else f"failed_{index}",
+            ),
+            finish=None if failure == "eof" else "tool_calls",
+        )
+        for index in range(rounds)
+    ]
+    entity, log, create = _setup(
+        hass, streams, options={"max_function_calls_per_conversation": limit}
+    )
+    checkpoint = log.content.copy()
 
     with pytest.raises(ParseArgumentsFailed):
         await _run(entity, log)
 
-    assert create.await_count == 3
-    entity._execute_function_tool.assert_awaited_once()
-    assert len(_results(log)) == 1
-    assert log.content[-1].role == "tool_result"
+    assert create.await_count == rounds
+    assert log.content == checkpoint
+    entity._execute_function_tool.assert_not_awaited()
+    for request, stream in zip(create.await_args_list, streams, strict=True):
+        assert request.kwargs["tool_choice"] == "auto"
+        _assert_paired_tools(request.kwargs["messages"])
+        stream.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 10, -1])
+async def test_alternating_execution_and_correction_share_counter(hass, limit):
+    rounds = limit if limit >= 0 else MAX_TOOL_ITERATIONS
+    streams = []
+    for index in range(rounds):
+        if index % 2:
+            streams.append(_calls(_tool("{", call_id=f"failed_{index}")))
+        else:
+            calls = (
+                [
+                    _tool(
+                        json.dumps({"value": index // 2 - 1}),
+                        call_id=f"replayed_{index}",
+                    )
+                ]
+                if index
+                else []
+            )
+            calls.append(
+                _tool(
+                    json.dumps({"value": index // 2}),
+                    index=len(calls),
+                    call_id=f"success_{index}",
+                )
+            )
+            streams.append(_calls(*calls))
+    if rounds % 2:
+        streams.append(_answer())
+    entity, log, create = _setup(
+        hass, streams, options={"max_function_calls_per_conversation": limit}
+    )
+
+    if rounds % 2:
+        await _run(entity, log)
+        assert log.content[-1].content == "Finished."
+        assert not log.unresponded_tool_results
+    else:
+        with pytest.raises(ParseArgumentsFailed):
+            await _run(entity, log)
+        assert log.content[-1].role == "tool_result"
+
+    assert create.await_count == len(streams)
+    assert [
+        c.args[1].tool_args for c in entity._execute_function_tool.await_args_list
+    ] == [{"value": index} for index in range((rounds + 1) // 2)]
+    assert all(
+        tool_input.tool_args
+        for content in log.content
+        if content.role == "assistant"
+        for tool_input in content.tool_calls or []
+    )
+    for request, stream in zip(create.await_args_list, streams, strict=True):
+        _assert_paired_tools(request.kwargs["messages"])
+        stream.close.assert_awaited_once()
+
+
+async def test_repeated_corrections_reuse_successes_but_normal_repeats_execute(hass):
+    entity, log, create = _setup(
+        hass,
+        [
+            _calls(_tool('{"value":1}', call_id="first")),
+            _calls(_tool("{", call_id="bad_json")),
+            _calls(_tool("[]", call_id="bad_type")),
+            _calls(
+                _tool('{"value":1}', call_id="replay_first"),
+                _tool('{"value":2}', index=1, call_id="second"),
+            ),
+            _calls(_tool('{"value":2}', call_id="intentional_repeat")),
+            _calls(_tool("{", call_id="bad_json_again")),
+            _calls(_tool("[]", call_id="bad_type_again")),
+            _calls(
+                _tool('{"value":2}', call_id="replay_second"),
+                _tool('{"value":3}', index=1, call_id="third"),
+            ),
+            _calls(_tool('{"value":4}', call_id="fourth")),
+            _calls(_tool('{"value":5}', call_id="fifth")),
+            _answer(),
+        ],
+        options={"max_function_calls_per_conversation": 10},
+    )
+
+    await _run(entity, log)
+
+    assert create.await_count == 11
+    assert [c.args[1].id for c in entity._execute_function_tool.await_args_list] == [
+        "first",
+        "second",
+        "intentional_repeat",
+        "third",
+        "fourth",
+        "fifth",
+    ]
+    results = _results(log)
+    assert _tool_result_data(results[0]) == _tool_result_data(results[1])
+    assert _tool_result_data(results[3]) == _tool_result_data(results[4])
+    for request in create.await_args_list:
+        _assert_paired_tools(request.kwargs["messages"])
+    assert create.await_args.kwargs["tool_choice"] == "none"
+    assert log.content[-1].content == "Finished."
+    assert not log.unresponded_tool_results
+
+
+@pytest.mark.parametrize("limit", [1, 2, 3, 10, -1, MAX_TOOL_ITERATIONS + 10])
+async def test_normal_tools_also_reach_limit_and_finish_with_text(hass, limit):
+    rounds = min(limit, MAX_TOOL_ITERATIONS) if limit >= 0 else MAX_TOOL_ITERATIONS
+    streams = [
+        _calls(_tool(json.dumps({"value": index}), call_id=f"call_{index}"))
+        for index in range(rounds)
+    ] + [_answer()]
+    entity, log, create = _setup(
+        hass, streams, options={"max_function_calls_per_conversation": limit}
+    )
+
+    await _run(entity, log)
+
+    assert create.await_count == rounds + 1
+    assert entity._execute_function_tool.await_count == rounds
+    assert [c.kwargs["tool_choice"] for c in create.await_args_list] == [
+        *(["auto"] * rounds),
+        "none",
+    ]
+    assert log.content[-1].content == "Finished."
+    assert not log.unresponded_tool_results
+
+
+@pytest.mark.parametrize("limit", [0, 1])
+@pytest.mark.parametrize("arguments", ["{}", "{"])
+async def test_backend_cannot_execute_tools_after_limit(hass, limit, arguments):
+    streams = ([_calls(_tool('{"value":1}', call_id="completed"))] if limit else []) + [
+        _calls(_tool(arguments, call_id="over_limit"))
+    ]
+    entity, log, create = _setup(
+        hass, streams, options={"max_function_calls_per_conversation": limit}
+    )
+
+    with pytest.raises(HomeAssistantError):
+        await _run(entity, log)
+
+    assert create.await_count == limit + 1
+    assert create.await_args.kwargs["tool_choice"] == "none"
+    assert entity._execute_function_tool.await_count == limit
+    assert [r.tool_call_id for r in _results(log)] == (["completed"] if limit else [])
+    assert log.content[-1].role == ("tool_result" if limit else "user")
+    assert "over_limit" not in str(log.as_dict())
     for stream in streams:
         stream.close.assert_awaited_once()
+
+
+async def test_zero_tool_budget_still_allows_text(hass):
+    entity, log, create = _setup(
+        hass, [_answer()], options={"max_function_calls_per_conversation": 0}
+    )
+
+    await _run(entity, log)
+
+    create.assert_awaited_once()
+    assert create.await_args.kwargs["tool_choice"] == "none"
+    entity._execute_function_tool.assert_not_awaited()
+    assert log.content[-1].content == "Finished."
 
 
 @pytest.mark.parametrize("first_missing_id", [False, True])
@@ -380,6 +626,7 @@ async def test_two_failures_restore_request_checkpoint(
             _calls(_tool("{", call_id=None if first_missing_id else "first")),
             _calls(_tool("{", call_id=None if second_missing_id else "second")),
         ],
+        options={"max_function_calls_per_conversation": 2},
     )
     checkpoint = log.content.copy()
 
@@ -392,7 +639,7 @@ async def test_two_failures_restore_request_checkpoint(
     _assert_paired_tools(create.await_args_list[1].kwargs["messages"])
 
 
-async def test_retry_budget_and_replay_cache_reset_for_next_user_turn(hass):
+async def test_shared_tool_budget_and_replay_cache_reset_for_next_user_turn(hass):
     entity, log, create = _setup(
         hass,
         [
@@ -403,6 +650,7 @@ async def test_retry_budget_and_replay_cache_reset_for_next_user_turn(hass):
             _calls(_tool("{}", call_id="second_turn")),
             _answer(),
         ],
+        options={"max_function_calls_per_conversation": 2},
     )
 
     await _run(entity, log)
@@ -497,6 +745,7 @@ async def test_invalid_correction_is_not_executed(hass, invalid_repair):
     entity, log, create = _setup(
         hass,
         [_calls(_tool('{"value":1}', call_id="completed")), _calls(_tool("{")), repair],
+        options={"max_function_calls_per_conversation": 3},
     )
 
     with pytest.raises(ParseArgumentsFailed):
@@ -511,7 +760,7 @@ async def test_retry_preserves_limits_and_request_options(hass):
     entity, log, create = _setup(
         hass,
         [_calls(_tool("{")), _calls(_tool("{}")), _answer()],
-        options={"max_function_calls_per_conversation": 1, "temperature": 0.3},
+        options={"max_function_calls_per_conversation": 2, "temperature": 0.3},
     )
 
     await _run(entity, log)
@@ -818,6 +1067,7 @@ async def test_terminal_error_and_diagnostics_are_redacted(
             _calls(_tool(broken)),
             _calls(_tool(broken)),
         ],
+        options={"max_function_calls_per_conversation": 3},
         agent_class=ExtendedOpenAIAgentEntity,
     )
     entity._get_exposed_entities = MagicMock(return_value=[])
@@ -843,7 +1093,7 @@ async def test_terminal_error_and_diagnostics_are_redacted(
     assert secret not in str(result.as_dict())
     assert secret not in caplog.text
     assert "arguments_length=" in caplog.text
-    assert "retry_used=True" in caplog.text
+    assert "tool_rounds=3, tool_limit=3" in caplog.text
     error = ParseArgumentsFailed(broken)
     assert secret not in str(error)
     assert secret not in repr(error.args)
