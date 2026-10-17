@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass, field
 import json
 import logging
 from mimetypes import guess_file_type
@@ -65,10 +66,28 @@ if TYPE_CHECKING:
 
 _LOGGER = logging.getLogger(__name__)
 
-# Max number of back and forth with the LLM to generate a response
+# Internal tool-round limit, including malformed calls. Allow a final text reply.
 MAX_TOOL_ITERATIONS = 20
 
 _NATIVE_TOOL_CALL_EXTRA_CONTENT_KEY = "tool_call_extra_content_by_id"
+
+_TOOL_ARGUMENTS_SCHEMA = vol.Schema(dict)
+
+
+@dataclass
+class _ToolCallResponse:
+    """Request-local wire data; malformed arguments must never become HA ToolInput."""
+
+    tool_calls: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    errors: dict[int, dict[str, str]] = field(default_factory=dict, repr=False)
+    content: str = field(default="", repr=False)
+    complete: bool = False
+    has_tool_calls: bool = False
+
+
+def _tool_call_key(tool_input: llm.ToolInput) -> tuple[str, str]:
+    """Identify a completed call when a correction changes its provider ID."""
+    return tool_input.tool_name, json.dumps(tool_input.tool_args, sort_keys=True)
 
 
 def _shorten_tool_call_id(tool_call_id: str) -> str:
@@ -76,6 +95,53 @@ def _shorten_tool_call_id(tool_call_id: str) -> str:
     import hashlib
 
     return hashlib.sha256(tool_call_id.encode()).hexdigest()[:9]
+
+
+def _tool_error_messages(
+    response: _ToolCallResponse, shorten_tool_call_id: bool
+) -> list[ChatCompletionMessageParam]:
+    """Pair the original wire calls with errors, without inventing HA arguments.
+
+    Chat Completions allows arguments to be an unparsed string. HA requires a
+    dict, so these pairs exist only in the retry request, never in ChatLog.
+    A missing identity, duplicate ID or unfinished response cannot be paired:
+    return no feedback and retry from the last complete history instead.
+    """
+    if not response.complete or not response.tool_calls or not response.errors:
+        return []
+    calls: list[Any] = []
+    results: list[ChatCompletionMessageParam] = []
+    seen_ids: set[str] = set()
+    for index, call in enumerate(response.tool_calls):
+        if not call["id"] or not call["name"]:
+            return []
+        call_id = (
+            _shorten_tool_call_id(call["id"]) if shorten_tool_call_id else call["id"]
+        )
+        if call_id in seen_ids:
+            return []
+        seen_ids.add(call_id)
+        wire_call = {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": call["name"], "arguments": call["arguments"]},
+        }
+        if "extra_content" in call:
+            wire_call["extra_content"] = call["extra_content"]
+        calls.append(wire_call)
+        results.append(
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": json.dumps(
+                    response.errors.get(index, {"status": "not_executed"})
+                ),
+            }
+        )
+    return [
+        {"role": "assistant", "content": response.content or None, "tool_calls": calls},
+        *results,
+    ]
 
 
 def _extract_extra_content(value: Any) -> dict[str, Any] | None:
@@ -476,35 +542,108 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             tool_kwargs["tools"] = tools
             tool_kwargs["tool_choice"] = "auto"
 
-        # To prevent infinite loops, we limit the number of iterations
-        for n_requests in range(MAX_TOOL_ITERATIONS):
-            # Update tool_choice based on function call count
-            # -1 means unlimited function calls
-            if tools and 0 <= max_function_calls <= n_requests:
-                tool_kwargs["tool_choice"] = "none"
+        # Valid and invalid tool-call responses share the configured budget.
+        # Even an unlimited configuration remains bounded by the internal cap.
+        tool_round_limit = (
+            MAX_TOOL_ITERATIONS
+            if max_function_calls < 0
+            else min(max_function_calls, MAX_TOOL_ITERATIONS)
+        )
+        tool_rounds = 0
+        completed_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
+        completed_ids: dict[str, tuple[str, str]] = {}
+        retrying = False
+        replay_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
+        request_messages = messages
 
-            _LOGGER.info("Prompt for %s: %s", model, json.dumps(messages))
-
+        # Reserve one response for final text after the last successful tool round.
+        for n_requests in range(MAX_TOOL_ITERATIONS + 1):
+            tools_allowed = bool(tools) and tool_rounds < tool_round_limit
+            if tools:
+                tool_kwargs["tool_choice"] = "auto" if tools_allowed else "none"
+            history_before_request = chat_log.content.copy()
+            _LOGGER.debug(
+                "Requesting response (iteration=%s, correction=%s, messages=%s)",
+                n_requests + 1,
+                retrying,
+                len(request_messages),
+            )
             stream = await self._client.chat.completions.create(
-                messages=messages,
+                messages=request_messages,
                 **api_kwargs,
                 **tool_kwargs,
             )
-
-            # Process stream and collect tool calls
             pending_tool_calls: list[llm.ToolInput] = []
-
-            async for content in chat_log.async_add_delta_content_stream(
-                self.entity_id, self._transform_stream(chat_log, stream)
-            ):
+            response = _ToolCallResponse()
+            try:
+                try:
+                    deltas = (
+                        self._validated_retry_stream(
+                            chat_log, stream, completed_ids, response
+                        )
+                        if retrying
+                        else self._transform_stream(chat_log, stream, response)
+                    )
+                    async for content in chat_log.async_add_delta_content_stream(
+                        self.entity_id, deltas
+                    ):
+                        if (
+                            isinstance(content, conversation.AssistantContent)
+                            and content.tool_calls
+                        ):
+                            pending_tool_calls.extend(content.tool_calls)
+                    if response.has_tool_calls and not tools_allowed:
+                        # Some compatible backends ignore tool_choice="none".
+                        # Do not commit or execute calls beyond the shared limit.
+                        chat_log.content[:] = history_before_request
+                        raise HomeAssistantError("Tool call limit reached")
+                finally:
+                    # Count a response once, even for multiple calls, invalid
+                    # JSON, missing identities or an unfinished argument stream.
+                    if response.has_tool_calls:
+                        tool_rounds += 1
+                    await stream.close()
+            except ParseArgumentsFailed as err:
+                # HA may have streamed text, but no tool in this response has
+                # run. Restore only this request's checkpoint, never the turn.
+                chat_log.content[:] = history_before_request
+                _LOGGER.warning(
+                    "Invalid tool arguments (iteration=%s, tool_rounds=%s, "
+                    "tool_limit=%s, reason=%s, tool_index=%s, arguments_length=%s, "
+                    "position=%s, finish_reason=%s)",
+                    n_requests + 1,
+                    tool_rounds,
+                    tool_round_limit,
+                    err.reason,
+                    err.tool_index,
+                    err.arguments_length,
+                    err.position,
+                    err.finish_reason,
+                )
                 if (
-                    isinstance(content, conversation.AssistantContent)
-                    and content.tool_calls
+                    not tools_allowed
+                    or not response.has_tool_calls
+                    or tool_rounds >= tool_round_limit
                 ):
-                    pending_tool_calls.extend(content.tool_calls)
+                    raise
+                retrying = True
+                replay_results = completed_results.copy()
+                # Use only actual parser/validator output. If the wire call is
+                # incomplete, replay the clean checkpoint without prompts or
+                # fabricated tool IDs/results. Both paths use the shared budget.
+                request_messages = [
+                    *messages,
+                    *_tool_error_messages(response, shorten_tool_call_id),
+                ]
+                continue
+
+            if retrying:
+                _LOGGER.debug("Tool argument correction succeeded")
 
             if pending_tool_calls:
-                _LOGGER.info("Response Tool Calls %s", pending_tool_calls)
+                _LOGGER.debug(
+                    "Response includes %s tool calls", len(pending_tool_calls)
+                )
 
             # Execute custom functions
             for tool_input in pending_tool_calls:
@@ -520,14 +659,28 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                 if function_tool is None:
                     raise FunctionNotFound(tool_input.tool_name)
 
-                tool_result_content = await self._execute_function_tool(
-                    function_tool,
-                    tool_input,
-                    llm_context,
-                    exposed_entities,
-                )
+                call_key = _tool_call_key(tool_input)
+                if (previous_result := replay_results.get(call_key)) is not None:
+                    # Only the correction response reuses earlier successes.
+                    # New IDs still need a matching result in the protocol.
+                    tool_result_content = _make_tool_result_content(
+                        self.entity_id,
+                        tool_input.id,
+                        tool_input.tool_name,
+                        _tool_result_data(previous_result),
+                    )
+                    _LOGGER.debug("Reusing completed tool result during correction")
+                else:
+                    tool_result_content = await self._execute_function_tool(
+                        function_tool,
+                        tool_input,
+                        llm_context,
+                        exposed_entities,
+                    )
 
                 chat_log.async_add_assistant_content_without_tools(tool_result_content)
+                completed_results[call_key] = tool_result_content
+                completed_ids[tool_input.id] = call_key
 
             # Update messages for next iteration
             messages = _convert_content_to_param(
@@ -537,15 +690,47 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             # Check if we need to continue (if there are pending tool results)
             if not chat_log.unresponded_tool_results:
                 break
+            retrying = False
+            replay_results = {}
+            request_messages = messages
+
+    async def _validated_retry_stream(
+        self,
+        chat_log: conversation.ChatLog,
+        stream: AsyncStream[ChatCompletionChunk],
+        completed_ids: dict[str, tuple[str, str]],
+        response: _ToolCallResponse,
+    ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
+        """Validate the entire correction before exposing any more deltas to HA."""
+        deltas = [
+            delta async for delta in self._transform_stream(chat_log, stream, response)
+        ]
+        tool_calls = [
+            tool_call
+            for delta in deltas
+            for tool_call in delta.get("tool_calls", []) or []
+        ]
+        if not tool_calls and not response.content:
+            raise ParseArgumentsFailed("", reason="empty_response")
+        for tool_call in tool_calls:
+            completed_key = completed_ids.get(tool_call.id)
+            if completed_key is not None and completed_key != _tool_call_key(tool_call):
+                raise ParseArgumentsFailed("", reason="invalid_tool_call_id")
+        # Do not repeat a tool-call preamble. A text-only response (for example
+        # a clarification or refusal) is the model's decision and is accepted.
+        for delta in deltas:
+            if "role" not in delta and (not tool_calls or "content" not in delta):
+                yield delta
 
     async def _transform_stream(
         self,
         chat_log: conversation.ChatLog,
         result: AsyncStream[ChatCompletionChunk],
-    ) -> AsyncGenerator[
-        conversation.AssistantContentDeltaDict | conversation.ToolResultContentDeltaDict
-    ]:
+        response: _ToolCallResponse | None = None,
+    ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
         """Transform OpenAI stream to Home Assistant format."""
+        if response is None:
+            response = _ToolCallResponse()
         current_tool_calls: dict[int, dict[str, Any]] = {}
         # Collect provider metadata across the whole response and attach it
         # once. HA only allows AssistantContent.native to be set a single time
@@ -554,9 +739,12 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         # finish reason more than once.
         tool_call_extra_content_by_id: dict[str, dict[str, Any]] = {}
         first_chunk = True
+        finish_reason = None
+        failure: ParseArgumentsFailed | None = None
+        seen_ids: set[str] = set()
 
         async for chunk in result:
-            _LOGGER.debug("Received chunk: %s", chunk)
+            _LOGGER.debug("Received response chunk (choices=%s)", len(chunk.choices))
 
             # Signal new assistant message on first chunk
             if first_chunk:
@@ -581,6 +769,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                 continue
 
             choice = chunk.choices[0]
+            finish_reason = choice.finish_reason
             delta = choice.delta
 
             if delta.content:
@@ -588,15 +777,16 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                 content_value = delta.content
                 if not isinstance(content_value, str):
                     _LOGGER.warning(
-                        "Received non-string content from API: %s (type: %s)",
-                        content_value,
+                        "Received non-string content from API (type: %s)",
                         type(content_value),
                     )
                     content_value = str(content_value) if content_value else ""
                 if content_value:
+                    response.content += content_value
                     yield {"content": content_value}
 
             if delta.tool_calls:
+                response.has_tool_calls = True
                 for tool_call_delta in delta.tool_calls:
                     idx = tool_call_delta.index
                     if idx not in current_tool_calls:
@@ -628,10 +818,44 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                 tool_calls_list = []
                 for idx in sorted(current_tool_calls.keys()):
                     tool_call = current_tool_calls[idx]
+                    call_index = len(response.tool_calls)
+                    response.tool_calls.append(tool_call.copy())
+                    if (
+                        not tool_call["id"]
+                        or not tool_call["name"]
+                        or tool_call["id"] in seen_ids
+                    ):
+                        failure = failure or ParseArgumentsFailed(
+                            tool_call["arguments"],
+                            tool_index=idx,
+                            reason="invalid_tool_call_id",
+                            finish_reason=choice.finish_reason,
+                        )
+                    seen_ids.add(tool_call["id"])
                     try:
-                        args = json.loads(tool_call["arguments"])
-                    except json.JSONDecodeError as err:
-                        raise ParseArgumentsFailed(tool_call["arguments"]) from err
+                        args = _TOOL_ARGUMENTS_SCHEMA(
+                            json.loads(tool_call["arguments"])
+                        )
+                    except (json.JSONDecodeError, vol.Invalid) as err:
+                        response.errors[call_index] = {
+                            "error": type(err).__name__,
+                            "error_text": str(err),
+                        }
+                        failure = failure or ParseArgumentsFailed(
+                            tool_call["arguments"],
+                            tool_index=idx,
+                            position=getattr(err, "pos", None),
+                            reason=(
+                                "invalid_json"
+                                if isinstance(err, json.JSONDecodeError)
+                                else "invalid_arguments"
+                            ),
+                            finish_reason=choice.finish_reason,
+                        )
+                        continue
+
+                    if failure is not None:
+                        continue
 
                     extra_content = tool_call.get("extra_content")
                     if tool_call["id"] and extra_content is not None:
@@ -645,7 +869,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                             external=True,  # Mark as external so ChatLog doesn't try to execute
                         )
                     )
-                if tool_calls_list:
+                if tool_calls_list and failure is None:
                     yield {"tool_calls": tool_calls_list}
                 current_tool_calls.clear()
             if choice.finish_reason == "length":
@@ -655,6 +879,25 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
 
             if choice.finish_reason == "stop":
                 break
+
+        if current_tool_calls:
+            if finish_reason is not None:
+                raise HomeAssistantError("Tool call response did not finish normally")
+            idx = min(current_tool_calls)
+            failure = failure or ParseArgumentsFailed(
+                current_tool_calls[idx]["arguments"],
+                tool_index=idx,
+                reason="unfinished_stream",
+                finish_reason="eof",
+            )
+
+        response.complete = (
+            finish_reason in {"tool_calls", "stop"} and not current_tool_calls
+        )
+        if failure is not None:
+            # Finish collecting this response before reporting a failed batch.
+            # Neither HA nor our executor has executed any of its calls.
+            raise failure from None
 
         if not first_chunk and tool_call_extra_content_by_id:
             yield {

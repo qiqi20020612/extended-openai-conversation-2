@@ -37,7 +37,12 @@ from .const import (
     EVENT_CONVERSATION_FINISHED,
 )
 from .entity import ExtendedOpenAIBaseLLMEntity
-from .exceptions import FunctionLoadFailed, FunctionNotFound, InvalidFunction
+from .exceptions import (
+    FunctionLoadFailed,
+    FunctionNotFound,
+    InvalidFunction,
+    ParseArgumentsFailed,
+)
 from .functions import get_function
 from .helpers import get_exposed_entities
 from .skills import Skill, SkillManager
@@ -144,24 +149,38 @@ class ExtendedOpenAIAgentEntity(
                 llm_context=llm_context,
             )
         except OpenAIError as err:
-            _LOGGER.error(err)
+            # API-compatible backends may echo arguments in an error body.
+            _LOGGER.error("OpenAI request failed (%s)", type(err).__name__)
             intent_response = intent.IntentResponse(language=user_input.language)
             intent_response.async_set_error(
                 intent.IntentResponseErrorCode.UNKNOWN,
-                f"Sorry, I had a problem talking to OpenAI: {err}",
+                f"Sorry, I had a problem talking to OpenAI ({type(err).__name__}).",
             )
             return conversation.ConversationResult(
                 response=intent_response, conversation_id=user_input.conversation_id
             )
         except HomeAssistantError as err:
             _LOGGER.error("Error during conversation: %s", err, exc_info=True)
+            error_message = f"Something went wrong: {err}"
+            argument_error = isinstance(err, ParseArgumentsFailed)
+            if argument_error:
+                chat_log.async_add_assistant_content_without_tools(
+                    conversation.AssistantContent(
+                        agent_id=self.entity_id, content=error_message
+                    )
+                )
             intent_response = intent.IntentResponse(language=user_input.language)
             intent_response.async_set_error(
                 intent.IntentResponseErrorCode.UNKNOWN,
-                f"Something went wrong: {err}",
+                error_message,
             )
             return conversation.ConversationResult(
-                response=intent_response, conversation_id=user_input.conversation_id
+                response=intent_response,
+                conversation_id=(
+                    chat_log.conversation_id
+                    if argument_error
+                    else user_input.conversation_id
+                ),
             )
 
         # Fire conversation finished event
