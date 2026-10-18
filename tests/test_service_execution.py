@@ -435,6 +435,7 @@ async def test_area_target_is_validated_without_changing_service_semantics(
 
 
 async def test_native_batch_retains_mixed_results_and_does_not_repeat(service_hass):
+    service_hass.states.async_set("light.other", "off")
     calls = []
 
     async def handler(call):
@@ -443,9 +444,11 @@ async def test_native_batch_retains_mixed_results_and_does_not_repeat(service_ha
             raise HomeAssistantError("private-token")
 
     service_hass.services.async_register("light", "turn_on", handler)
-    arguments = {"list": [service_args(), service_args(fail=True), service_args()]}
+    arguments = {
+        "list": [service_args(), service_args(fail=True), service_args("light.other")]
+    }
     result = await NativeFunction().execute_service(
-        service_hass, {}, arguments, None, EXPOSED
+        service_hass, {}, arguments, None, [*EXPOSED, {"entity_id": "light.other"}]
     )
 
     assert isinstance(result, llm.ToolResult) and result.error

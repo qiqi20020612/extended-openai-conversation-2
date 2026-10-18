@@ -43,6 +43,11 @@ EXPECTED_TOOL_ERRORS = (
     SelectorSyntaxError,
 )
 
+UNCONFIRMED_OPERATION_MESSAGE = (
+    "The operation may already have executed, in whole or in part. "
+    "Do not retry it directly. Query the actual state first."
+)
+
 
 def is_fatal_error(error: Exception) -> bool:
     """Configuration, programming and resource failures cannot be fixed by an LLM."""
@@ -131,6 +136,8 @@ def execution_error(
     }
     if status in {"unknown", "partial"}:
         data["requires_state_check"] = True
+        data["retryable"] = False
+        data["recovery_action"] = UNCONFIRMED_OPERATION_MESSAGE
     if is_permission_error(error):
         data["permission_denied"] = True
     if isinstance(error, ClientResponseError):

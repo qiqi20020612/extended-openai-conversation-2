@@ -68,12 +68,14 @@ from .exceptions import (
 from .functions import get_function
 from .functions.errors import (
     EXPECTED_TOOL_ERRORS,
+    UNCONFIRMED_OPERATION_MESSAGE,
     execution_error,
     function_is_read_only,
     is_fatal_error,
     result_blocks_replay,
     result_is_error,
 )
+from .functions.native import service_operation_keys
 from .helpers import get_model_config
 
 if TYPE_CHECKING:
@@ -103,6 +105,44 @@ class _ToolCallResponse:
 def _tool_call_key(tool_input: llm.ToolInput) -> tuple[str, str]:
     """Identify a completed call when a correction changes its provider ID."""
     return tool_input.tool_name, json.dumps(tool_input.tool_args, sort_keys=True)
+
+
+def _tool_operation_scopes(
+    hass: HomeAssistant, function_tool: dict[str, Any] | None, tool_input: llm.ToolInput
+) -> list[set[tuple[str, ...]]]:
+    """Resolve service actions/targets before dispatch; do not guess script effects.
+
+    A batch retains one scope per member so an explicitly unexecuted member can
+    be corrected, while completed/unknown members cannot be replayed in a new batch.
+    No target identities or argument values are added to results or diagnostics.
+    """
+    config = function_tool["function"] if function_tool else {}
+    name = config.get("name")
+    if config.get("type") != "native" or name not in {
+        "execute_service",
+        "execute_service_single",
+    }:
+        # Arbitrary scripts/composites can affect targets absent from their input.
+        # Different arguments alone cannot establish that their effects are disjoint.
+        return [{("configured_tool", tool_input.tool_name)}]
+    arguments = (
+        tool_input.tool_args.get("list", [])
+        if name == "execute_service"
+        else [tool_input.tool_args]
+    )
+    if not isinstance(arguments, list):
+        return []  # The executor will report the invalid input without dispatching.
+    scopes: list[set[tuple[str, ...]]] = []
+    for argument in arguments:
+        try:
+            scope = service_operation_keys(hass, vol.Schema(dict)(argument))
+        except EXPECTED_TOOL_ERRORS as err:
+            if is_fatal_error(err) or hass.is_stopping:
+                raise
+            scopes.append(set())
+            continue
+        scopes.append(scope)
+    return scopes
 
 
 def _shorten_tool_call_id(tool_call_id: str) -> str:
@@ -587,7 +627,8 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         completed_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
         completed_ids: dict[str, tuple[str, str]] = {}
         results_by_id: dict[str, conversation.ToolResultContent] = {}
-        blocked_functions: dict[str, conversation.ToolResultContent] = {}
+        blocked_operations: dict[tuple[str, ...], conversation.ToolResultContent] = {}
+        denied_functions: dict[str, conversation.ToolResultContent] = {}
         retrying = False
         replay_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
         request_messages = messages
@@ -686,9 +727,10 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     "Response includes %s tool calls", len(pending_tool_calls)
                 )
 
-            # A new model response may not rewrite an unconfirmed operation to
-            # evade replay protection. Calls already in this batch are independent.
-            blocked_before_batch = blocked_functions.copy()
+            # Permission denials retain the existing per-tool boundary. Uncertain
+            # service effects protect only overlapping actions/targets, including
+            # overlaps inside one response; unrelated calls remain independent.
+            denied_before_batch = denied_functions.copy()
             answered: set[str] = set()
             active_tool: llm.ToolInput | None = None
             batch_has_error = False
@@ -702,6 +744,18 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                             f
                             for f in function_tools
                             if f["spec"]["name"] == tool_input.tool_name
+                        ),
+                        None,
+                    )
+                    operation_scopes = _tool_operation_scopes(
+                        self.hass, function_tool, tool_input
+                    )
+                    blocked = denied_before_batch.get(tool_input.tool_name) or next(
+                        (
+                            blocked_operations[key]
+                            for scope in operation_scopes
+                            for key in scope
+                            if key in blocked_operations
                         ),
                         None,
                     )
@@ -719,24 +773,22 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     if previous_result is not None:
                         outcome = _tool_result(previous_result)
                         _LOGGER.debug("Reusing recorded tool result")
-                    elif tool_input.tool_name in blocked_before_batch:
-                        previous = _tool_result(
-                            blocked_before_batch[tool_input.tool_name]
-                        )
+                    elif blocked is not None:
+                        previous = _tool_result(blocked)
+                        denied = bool(previous.data.get("permission_denied"))
                         outcome = llm.ToolResult(
                             data={
                                 "error": "UnsafeRetryBlocked",
+                                "error_text": "Access denied by the configured permissions."
+                                if denied
+                                else UNCONFIRMED_OPERATION_MESSAGE,
                                 "execution_status": "not_executed",
                                 "retryable": False,
                                 "previous_execution_status": previous.data.get(
                                     "execution_status"
                                 ),
-                                "requires_state_check": bool(
-                                    previous.data.get("requires_state_check")
-                                ),
-                                "permission_denied": bool(
-                                    previous.data.get("permission_denied")
-                                ),
+                                "requires_state_check": not denied,
+                                "permission_denied": denied,
                             },
                             error=True,
                         )
@@ -759,6 +811,13 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                             _LOGGER.warning(
                                 "Tool execution failed (%s)", type(err).__name__
                             )
+                    if outcome.error and outcome.data.get("execution_status") in {
+                        "unknown",
+                        "partial",
+                    }:
+                        outcome.data["retryable"] = False
+                        outcome.data["requires_state_check"] = True
+                        outcome.data["recovery_action"] = UNCONFIRMED_OPERATION_MESSAGE
                     tool_result_content = _make_tool_result_content(
                         self.entity_id,
                         tool_input.id,
@@ -773,10 +832,35 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     results_by_id[tool_input.id] = tool_result_content
                     if not outcome.error or result_blocks_replay(outcome):
                         completed_results[call_key] = tool_result_content
-                    if outcome.data.get("permission_denied") or outcome.data.get(
-                        "execution_status"
-                    ) in {"unknown", "partial"}:
-                        blocked_functions[tool_input.tool_name] = tool_result_content
+                    if outcome.data.get("permission_denied"):
+                        denied_functions[tool_input.tool_name] = tool_result_content
+                    if outcome.data.get("execution_status") in {
+                        "unknown",
+                        "partial",
+                    }:
+                        member_results = (
+                            outcome.data.get("results")
+                            if function_tool is not None
+                            and function_tool["function"].get("type") == "native"
+                            and function_tool["function"].get("name")
+                            == "execute_service"
+                            else None
+                        )
+                        for index, scope in enumerate(operation_scopes):
+                            # Native batches preserve an outcome per member. An
+                            # input rejected before dispatch remains safe to fix.
+                            member = (
+                                member_results[index]
+                                if isinstance(member_results, list)
+                                and len(member_results) == len(operation_scopes)
+                                else None
+                            )
+                            if isinstance(member, dict) and member.get(
+                                "execution_status"
+                            ) in {"not_executed", "failed"}:
+                                continue
+                            for key in scope:
+                                blocked_operations[key] = tool_result_content
                     batch_has_error |= outcome.error
                     self._add_tool_result(chat_log, tool_result_content)
                     active_tool = None

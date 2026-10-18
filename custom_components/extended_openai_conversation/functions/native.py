@@ -9,6 +9,7 @@ from datetime import timedelta
 from functools import partial
 import logging
 import os
+from threading import Lock
 import time
 from typing import Any
 
@@ -33,12 +34,100 @@ from ..exceptions import (
     NativeNotFound,
 )
 from .base import Function
-from .errors import EXPECTED_TOOL_ERRORS, execution_error, is_fatal_error
+from .errors import (
+    EXPECTED_TOOL_ERRORS,
+    UNCONFIRMED_OPERATION_MESSAGE,
+    execution_error,
+    is_fatal_error,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
 # Bound the Assist wait. A timeout never proves that an action did not happen.
 _SERVICE_CALL_TIMEOUT = 30
+
+# Executor jobs can outlive the awaiting conversation, including cancellation.
+# Hold a thread lock across the whole read/check/write transaction in the job.
+_AUTOMATION_STORAGE_LOCK = Lock()
+
+
+def service_call_arguments(
+    arguments: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    """Normalize the supported service argument forms without mutating input."""
+    domain = vol.Schema(str)(arguments["domain"])
+    service = vol.Schema(str)(arguments["service"])
+    data = deepcopy(
+        vol.Schema(dict)(arguments.get("service_data", arguments.get("data", {})))
+    )
+    entity_ids = data.get("entity_id", arguments.get("entity_id"))
+    if isinstance(entity_ids, str):
+        entity_ids = [item.strip() for item in entity_ids.split(",") if item.strip()]
+    if entity_ids is not None:
+        data["entity_id"] = vol.Schema([str])(entity_ids)
+    return domain, service, data
+
+
+def service_target_entities(
+    hass: HomeAssistant, domain: str, service: str, data: dict[str, Any]
+) -> set[str]:
+    """Use HA's effective target set for exposure and operation-overlap checks."""
+    selection = target.TargetSelection(data)
+    selected = target.async_extract_referenced_entity_ids(hass, selection)
+    if any(
+        (
+            selected.missing_areas,
+            selected.missing_devices,
+            selected.missing_floors,
+            selected.missing_labels,
+        )
+    ):
+        raise EntityNotFound("target")
+    all_entities = selected.referenced | selected.indirectly_referenced
+    registered_service = hass.services.async_services()[domain][service]
+    handler = registered_service.job.target
+    # Platform service domains can differ from the domains of their entities.
+    if isinstance(handler, partial) and handler.func in {
+        ha_service.entity_service_call,
+        ha_service.batched_entity_service_call,
+    }:
+        entities = (
+            handler.args[1]
+            if len(handler.args) > 1
+            else handler.keywords.get("registered_entities")
+        )
+        if callable(entities):
+            entities = entities()
+        if isinstance(entities, Mapping):
+            all_entities.intersection_update(entities)
+    elif domain == "homeassistant" and service in {"turn_on", "turn_off", "toggle"}:
+        all_entities = {
+            entity_id
+            for entity_id in all_entities
+            if (entity_domain := entity_id.partition(".")[0]) != domain
+            and hass.services.has_service(entity_domain, service)
+        }
+    # Unknown/custom handlers retain conservative checks of all targets.
+    return all_entities
+
+
+def service_operation_keys(
+    hass: HomeAssistant, arguments: dict[str, Any]
+) -> set[tuple[str, ...]]:
+    """Identify the same action through aliases and overlapping target selectors."""
+    domain, service, data = service_call_arguments(arguments)
+    return {
+        (
+            "ha_service",
+            entity_id.partition(".")[0]
+            if domain == "homeassistant"
+            and service in {"turn_on", "turn_off", "toggle"}
+            else domain,
+            service,
+            entity_id,
+        )
+        for entity_id in service_target_entities(hass, domain, service, data)
+    }
 
 
 class NativeFunction(Function):
@@ -112,24 +201,7 @@ class NativeFunction(Function):
     ) -> dict[str, Any]:
         started = False
         try:
-            domain = vol.Schema(str)(service_argument["domain"])
-            service = vol.Schema(str)(service_argument["service"])
-            service_data = deepcopy(
-                vol.Schema(dict)(
-                    service_argument.get(
-                        "service_data", service_argument.get("data", {})
-                    )
-                )
-            )
-            entity_ids = service_data.get(
-                "entity_id", service_argument.get("entity_id")
-            )
-            if isinstance(entity_ids, str):
-                entity_ids = [
-                    item.strip() for item in entity_ids.split(",") if item.strip()
-                ]
-            if entity_ids is not None:
-                service_data["entity_id"] = vol.Schema([str])(entity_ids)
+            domain, service, service_data = service_call_arguments(service_argument)
             selection = target.TargetSelection(service_data)
             if not selection.has_any_target:
                 raise CallServiceError(domain, service, {})
@@ -141,48 +213,8 @@ class NativeFunction(Function):
             # Validate direct IDs and every expanded group/area/device target.
             # Preserve service-specific target fields and HA's dispatch semantics.
             self.validate_entity_ids(hass, list(selection.entity_ids), exposed_entities)
-            selected = target.async_extract_referenced_entity_ids(hass, selection)
-            if any(
-                (
-                    selected.missing_areas,
-                    selected.missing_devices,
-                    selected.missing_floors,
-                    selected.missing_labels,
-                )
-            ):
-                raise EntityNotFound("target")
-            all_entities = selected.referenced | selected.indirectly_referenced
+            all_entities = service_target_entities(hass, domain, service, service_data)
             registered_service = hass.services.async_services()[domain][service]
-            handler = registered_service.job.target
-            # HA entity services intersect the expansion with their registered
-            # entities. Use that same set, including cross-domain platform services,
-            # rather than denying an unrelated sensor alongside an exposed light.
-            if isinstance(handler, partial) and handler.func in {
-                ha_service.entity_service_call,
-                ha_service.batched_entity_service_call,
-            }:
-                entities = (
-                    handler.args[1]
-                    if len(handler.args) > 1
-                    else handler.keywords.get("registered_entities")
-                )
-                if callable(entities):
-                    entities = entities()
-                if isinstance(entities, Mapping):
-                    all_entities.intersection_update(entities)
-            elif domain == "homeassistant" and service in {
-                "turn_on",
-                "turn_off",
-                "toggle",
-            }:
-                # Generic turn services route only to domains providing the action.
-                all_entities = {
-                    entity_id
-                    for entity_id in all_entities
-                    if (entity_domain := entity_id.partition(".")[0]) != domain
-                    and hass.services.has_service(entity_domain, service)
-                }
-            # Unknown/custom handlers retain conservative checks of all targets.
             if not all_entities:
                 raise EntityNotFound("target")
             self.validate_entity_ids(hass, list(all_entities), exposed_entities)
@@ -232,16 +264,33 @@ class NativeFunction(Function):
             )
         except (KeyError, vol.Invalid) as err:
             return execution_error(err, status="not_executed")
+        unconfirmed: set[tuple[str, ...]] = set()
         for service_argument in service_arguments:
-            result.append(
-                await self.execute_service_single(
+            try:
+                scope = service_operation_keys(hass, service_argument)
+            except EXPECTED_TOOL_ERRORS as err:
+                if is_fatal_error(err) or hass.is_stopping:
+                    raise
+                scope = set()  # The executor will return the actual input error.
+            if scope & unconfirmed:
+                item = {
+                    "error": "UnsafeRetryBlocked",
+                    "error_text": UNCONFIRMED_OPERATION_MESSAGE,
+                    "execution_status": "not_executed",
+                    "retryable": False,
+                    "requires_state_check": True,
+                }
+            else:
+                item = await self.execute_service_single(
                     hass,
                     function_config,
                     service_argument,
                     llm_context,
                     exposed_entities,
                 )
-            )
+            result.append(item)
+            if item.get("execution_status") in {"unknown", "partial"}:
+                unconfirmed.update(scope)
         if any("error" in item for item in result):
             partial = any(item.get("success") for item in result)
             status = (
@@ -316,7 +365,11 @@ class NativeFunction(Function):
                     output.write("\n" + raw_config)
                 return raw_config
 
-            raw_config = await hass.async_add_executor_job(append_automation)
+            def store_automation() -> str:
+                with _AUTOMATION_STORAGE_LOCK:
+                    return append_automation()
+
+            raw_config = await hass.async_add_executor_job(store_automation)
             async with asyncio.timeout(_SERVICE_CALL_TIMEOUT):
                 await hass.services.async_call(
                     automation.config.DOMAIN,

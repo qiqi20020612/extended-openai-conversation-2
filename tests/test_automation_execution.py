@@ -1,6 +1,10 @@
 """Automation validation and writes must have different retry semantics."""
 
+import asyncio
+import builtins
+from contextlib import suppress
 import json
+from threading import Barrier, BrokenBarrierError
 from unittest.mock import AsyncMock
 
 import probatio as vol
@@ -133,6 +137,65 @@ async def test_duplicate_automation_id_never_appends_or_reloads(
     assert result.error and result.data["execution_status"] == "not_executed"
     assert path.read_text() == original
     hass.services.async_call.assert_not_awaited()
+
+
+@pytest.mark.parametrize("initial", [None, "", "[]\n"])
+@pytest.mark.parametrize("same_id", [False, True])
+async def test_concurrent_automation_storage_preserves_writes_and_checks_ids(
+    hass, monkeypatch, tmp_path, initial, same_id
+):
+    monkeypatch.setattr(VALIDATOR, AsyncMock(return_value={}))
+    path = tmp_path / "automations.yaml"
+    if initial is not None:
+        path.write_text(initial)
+    original_open = builtins.open
+    original_load = yaml.safe_load
+    readers = Barrier(2)
+
+    def overlap_empty_reads():
+        # Without serialization both jobs see empty storage before either writes.
+        # A serialized first reader times out here, then the next sees its write.
+        with suppress(BrokenBarrierError):
+            readers.wait(timeout=0.1)
+
+    def checked_open(filename, *args, **kwargs):
+        try:
+            return original_open(filename, *args, **kwargs)
+        except FileNotFoundError:
+            if str(filename) == str(path):
+                overlap_empty_reads()
+            raise
+
+    def checked_load(raw):
+        loaded = original_load(raw)
+        if raw in {"", "[]\n"}:
+            overlap_empty_reads()
+        return loaded
+
+    monkeypatch.setattr(builtins, "open", checked_open)
+    monkeypatch.setattr(yaml, "safe_load", checked_load)
+    hass.async_add_executor_job.side_effect = asyncio.to_thread
+    results = await asyncio.gather(
+        *[
+            get_function("native").add_automation(
+                hass, {}, automation_args(identifier), None, []
+            )
+            for identifier in ["first", "first" if same_id else "second"]
+        ]
+    )
+
+    stored = yaml.safe_load(path.read_text())
+    assert sorted(item["id"] for item in stored) == (
+        ["first"] if same_id else ["first", "second"]
+    )
+    if same_id:
+        failed = [result for result in results if result != "Success"]
+        assert len(failed) == 1
+        assert failed[0].error
+        assert failed[0].data["execution_status"] == "not_executed"
+    else:
+        assert results == ["Success", "Success"]
+    assert hass.services.async_call.await_count == (1 if same_id else 2)
 
 
 @pytest.mark.parametrize(
