@@ -19,11 +19,15 @@ from tests.test_tool_execution import actual_entity, assert_paired, tool_config
 async def test_composite_stops_on_error_and_reports_each_step(
     hass, monkeypatch, earlier_success, failure_kind
 ):
+    kind = "read_file" if failure_kind == "legacy" else "template"
+    step = {
+        "type": kind,
+        **({"path": "unused"} if kind == "read_file" else {"value_template": "ok"}),
+    }
     config = get_function("composite").validate_schema(
         {
             "type": "composite",
-            "sequence": [{"type": "template", "value_template": "ok"}]
-            * (3 if earlier_success else 2),
+            "sequence": [step] * (3 if earlier_success else 2),
         }
     )
     failure = {
@@ -45,7 +49,7 @@ async def test_composite_stops_on_error_and_reports_each_step(
     execute = AsyncMock(
         side_effect=(["first completed"] if earlier_success else []) + [failure]
     )
-    monkeypatch.setattr(get_function("template"), "execute", execute)
+    monkeypatch.setattr(get_function(kind), "execute", execute)
 
     result = await get_function("composite").execute(hass, config, {}, None, [])
 

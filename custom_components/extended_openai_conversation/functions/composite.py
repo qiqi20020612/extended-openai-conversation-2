@@ -78,7 +78,7 @@ class CompositeFunction(Function):
                     if function_is_read_only(next_function_config)
                     else "unknown",
                 )
-            failed = result_is_error(result)
+            failed = result_is_error(result, next_function_config)
             data = result.data if isinstance(result, llm.ToolResult) else result
             steps.append(
                 {

@@ -1132,7 +1132,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                 try:
                     if isinstance(result, llm.ToolResult):
                         outcome = result
-                    elif result_is_error(result):
+                    elif result_is_error(result, function_config):
                         data = (
                             result if isinstance(result, dict) else {"results": result}
                         )
@@ -1192,10 +1192,11 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             result = await get_function(function_config["type"]).execute(
                 self.hass, function_config, arguments, llm_context, exposed_entities
             )
+            failed = result_is_error(result, function_config)
             _LOGGER.log(
-                logging.WARNING if result_is_error(result) else logging.DEBUG,
+                logging.WARNING if failed else logging.DEBUG,
                 "Background tool finished (status=%s)",
-                "failed_or_unknown" if result_is_error(result) else "completed",
+                "failed_or_unknown" if failed else "completed",
             )
         except asyncio.CancelledError:
             _LOGGER.debug("Background tool cancelled (outcome=unknown)")

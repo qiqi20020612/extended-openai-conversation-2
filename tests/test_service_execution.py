@@ -3,7 +3,8 @@
 import asyncio
 from copy import deepcopy
 import json
-from unittest.mock import AsyncMock
+import logging
+from unittest.mock import AsyncMock, MagicMock
 
 import probatio as vol
 import pytest
@@ -12,6 +13,7 @@ from custom_components.extended_openai_conversation.functions import (
     NativeFunction,
     get_function,
 )
+from homeassistant.components import homeassistant as homeassistant_component
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import (
@@ -20,7 +22,11 @@ from homeassistant.helpers import (
     device_registry as dr,
     entity_registry as er,
     llm,
+    service as ha_service,
 )
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.entity_component import EntityComponent
+from homeassistant.helpers.entity_platform import DATA_DOMAIN_PLATFORM_ENTITIES
 from tests.test_tool_argument_retry import _answer, _calls, _results, _tool
 from tests.test_tool_execution import actual_entity, assert_paired, tool_config
 
@@ -43,6 +49,126 @@ def service_args(entity="light.allowed", **data):
 
 
 EXPOSED = [{"entity_id": "light.allowed"}]
+
+
+@pytest.mark.parametrize("selector", ["area_id", "device_id"])
+@pytest.mark.parametrize("service_domain", ["light", "custom", "homeassistant"])
+async def test_entity_service_ignores_unrelated_domain_but_rejects_affected_private_entity(
+    service_hass, selector, service_domain
+):
+    await ar.async_load(service_hass, load_empty=True)
+    dr.async_setup(service_hass)
+    await dr.async_load(service_hass, load_empty=True)
+    await er.async_load(service_hass, load_empty=True)
+    service_hass.config_entries = MagicMock()
+    service_hass.config_entries.async_get_entry.return_value = MagicMock(
+        domain="test", entry_id="test", title="Test", pref_disable_new_entities=False
+    )
+    area = ar.async_get(service_hass).async_create("Mixed area")
+    devices = dr.async_get(service_hass)
+    device = devices.async_get_or_create(
+        config_entry_id="test", identifiers={("test", "mixed")}
+    )
+    devices.async_update_device(device.id, area_id=area.id)
+    registry = er.async_get(service_hass)
+    for entity_id in ["light.allowed", "light.private", "sensor.private"]:
+        service_hass.states.async_remove(entity_id)
+        domain, name = entity_id.split(".")
+        entry = registry.async_get_or_create(
+            domain,
+            "light" if domain == "light" else "test",
+            f"{domain}_{name}",
+            suggested_object_id=name,
+        )
+        registry.async_update_entity(
+            entry.entity_id,
+            area_id=area.id if selector == "area_id" else None,
+            device_id=device.id if selector == "device_id" else None,
+        )
+        if domain == "sensor":
+            service_hass.states.async_set(entity_id, "42")
+    calls = []
+
+    class TestLight(Entity):
+        _attr_should_poll = False
+
+        async def async_turn_on(self, **kwargs):
+            calls.append(self.entity_id)
+
+    component = EntityComponent(logging.getLogger(__name__), "light", service_hass)
+    component.register_shutdown()
+    lights = []
+    for entity_id in ["light.allowed", "light.private"]:
+        light = TestLight()
+        light.entity_id = entity_id
+        light._attr_unique_id = entity_id.replace(".", "_")
+        lights.append(light)
+    await component.async_add_entities(lights)
+    if selector == "device_id":
+        for light in lights:
+            registry.async_update_entity(light.entity_id, device_id=device.id)
+    component.async_register_entity_service("turn_on", {}, "async_turn_on")
+    if service_domain == "custom":
+        # Platform services may have a service domain different from entity domain.
+        service_hass.data[DATA_DOMAIN_PLATFORM_ENTITIES][("light", "custom")] = {
+            light.entity_id: light for light in lights
+        }
+        ha_service.async_register_platform_entity_service(
+            service_hass,
+            service_domain="custom",
+            service_name="turn_on",
+            entity_domain="light",
+            func="async_turn_on",
+            schema={},
+        )
+    elif service_domain == "homeassistant":
+        assert await homeassistant_component.async_setup(service_hass, {})
+    arguments = {
+        "domain": service_domain,
+        "service": "turn_on",
+        "service_data": {selector: area.id if selector == "area_id" else device.id},
+    }
+
+    # Both lights can be affected, so the private light must still deny dispatch.
+    denied = await NativeFunction().execute_service_single(
+        service_hass, {}, arguments, None, EXPOSED
+    )
+    assert denied["permission_denied"] and not calls
+    registry.async_update_entity("light.private", area_id=None, device_id=None)
+
+    # The private sensor remains in the target but cannot be affected by light.turn_on.
+    completed = await NativeFunction().execute_service_single(
+        service_hass, {}, arguments, None, EXPOSED
+    )
+    assert completed["execution_status"] == "service_completed"
+    assert calls == ["light.allowed"]
+    assert arguments["service_data"] == {
+        selector: area.id if selector == "area_id" else device.id
+    }
+
+    # A custom handler can affect multiple domains; do not infer its scope from
+    # its service-domain name or drop the sensor without HA entity registration.
+    custom = AsyncMock()
+    service_hass.services.async_register("light", "wide_action", custom)
+    denied = await NativeFunction().execute_service_single(
+        service_hass,
+        {},
+        {**arguments, "domain": "light", "service": "wide_action"},
+        None,
+        EXPOSED,
+    )
+    assert denied["permission_denied"]
+    custom.assert_not_awaited()
+
+    if service_domain == "homeassistant":
+        # Once a domain provides the action, the generic service could affect it.
+        sensor = AsyncMock()
+        service_hass.services.async_register("sensor", "turn_on", sensor)
+        denied = await NativeFunction().execute_service_single(
+            service_hass, {}, arguments, None, EXPOSED
+        )
+        assert denied["permission_denied"]
+        sensor.assert_not_awaited()
 
 
 async def test_real_ha_automation_validation_failure_never_writes(

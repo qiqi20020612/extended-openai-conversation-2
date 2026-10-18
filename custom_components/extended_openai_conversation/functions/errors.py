@@ -138,17 +138,23 @@ def execution_error(
     return llm.ToolResult(data=data, error=True)
 
 
-def result_is_error(result: Any) -> bool:
-    """Recognize existing error returns without wrapping them a second time."""
+def result_is_error(result: Any, config: dict[str, Any]) -> bool:
+    """Read explicit status, or legacy envelopes only from their known producers."""
     if isinstance(result, llm.ToolResult):
         return result.error
-    if isinstance(result, dict):
-        return (
-            "error" in result
-            or result.get("success") is False
-            or result.get("exit_code", 0) != 0
-        )
-    return isinstance(result, list) and any(result_is_error(item) for item in result)
+    if not isinstance(result, dict):
+        return False
+    function_type = config.get("type")
+    if function_type == "bash":
+        return "error" in result or result.get("exit_code", 0) != 0
+    if function_type in {"read_file", "write_file", "edit_file"} or (
+        function_type == "native" and config.get("name") == "execute_service_single"
+    ):
+        return "error" in result or result.get("success") is False
+    # SQLite rows, parsed templates, scripts and remote responses are business
+    # data. Their field names do not define execution status. Composite failures
+    # and native service batches already return explicit ToolResult instances.
+    return False
 
 
 def result_blocks_replay(result: llm.ToolResult) -> bool:

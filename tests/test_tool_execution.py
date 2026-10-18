@@ -366,11 +366,13 @@ async def test_legacy_error_return_retains_payload_and_error_flag(hass, monkeypa
         "retryable": True,
     }
     monkeypatch.setattr(
-        get_function("template"), "execute", AsyncMock(return_value=original)
+        get_function("read_file"), "execute", AsyncMock(return_value=original)
     )
     entity, log, create = actual_entity(hass, [_calls(_tool("{}")), _answer()])
 
-    await entity._async_handle_chat_log(log, [tool_config()], [])
+    await entity._async_handle_chat_log(
+        log, [tool_config(kind="read_file", path="unused")], []
+    )
 
     assert _results(log)[0].result.error
     assert _results(log)[0].result.data == original
@@ -385,7 +387,7 @@ async def test_error_without_execution_metadata_cannot_replay_side_effects(
     execute = AsyncMock(
         return_value=llm.ToolResult(data=failure, error=True) if native else failure
     )
-    monkeypatch.setattr(get_function("script"), "execute", execute)
+    monkeypatch.setattr(get_function("bash"), "execute", execute)
     entity, log, create = actual_entity(
         hass,
         [
@@ -396,7 +398,7 @@ async def test_error_without_execution_metadata_cannot_replay_side_effects(
     )
 
     await entity._async_handle_chat_log(
-        log, [tool_config(kind="script", sequence=[])], []
+        log, [tool_config(kind="bash", command="printf unused")], []
     )
 
     execute.assert_awaited_once()

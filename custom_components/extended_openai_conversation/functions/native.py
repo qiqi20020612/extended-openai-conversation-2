@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from copy import deepcopy
 from datetime import timedelta
+from functools import partial
 import logging
 import os
 import time
@@ -19,7 +21,7 @@ from homeassistant.config import AUTOMATION_CONFIG_PATH
 from homeassistant.const import SERVICE_RELOAD
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
-from homeassistant.helpers import llm, target
+from homeassistant.helpers import llm, service as ha_service, target
 import homeassistant.util.dt as dt_util
 
 from ..const import EVENT_AUTOMATION_REGISTERED
@@ -150,12 +152,43 @@ class NativeFunction(Function):
             ):
                 raise EntityNotFound("target")
             all_entities = selected.referenced | selected.indirectly_referenced
+            registered_service = hass.services.async_services()[domain][service]
+            handler = registered_service.job.target
+            # HA entity services intersect the expansion with their registered
+            # entities. Use that same set, including cross-domain platform services,
+            # rather than denying an unrelated sensor alongside an exposed light.
+            if isinstance(handler, partial) and handler.func in {
+                ha_service.entity_service_call,
+                ha_service.batched_entity_service_call,
+            }:
+                entities = (
+                    handler.args[1]
+                    if len(handler.args) > 1
+                    else handler.keywords.get("registered_entities")
+                )
+                if callable(entities):
+                    entities = entities()
+                if isinstance(entities, Mapping):
+                    all_entities.intersection_update(entities)
+            elif domain == "homeassistant" and service in {
+                "turn_on",
+                "turn_off",
+                "toggle",
+            }:
+                # Generic turn services route only to domains providing the action.
+                all_entities = {
+                    entity_id
+                    for entity_id in all_entities
+                    if (entity_domain := entity_id.partition(".")[0]) != domain
+                    and hass.services.has_service(entity_domain, service)
+                }
+            # Unknown/custom handlers retain conservative checks of all targets.
             if not all_entities:
                 raise EntityNotFound("target")
             self.validate_entity_ids(hass, list(all_entities), exposed_entities)
             # HA validates again at dispatch. This preflight keeps schema failures
             # distinguishable from exceptions raised after the handler starts.
-            schema = hass.services.async_services()[domain][service].schema
+            schema = registered_service.schema
             if schema is not None:
                 schema(deepcopy(service_data))
             started = True
