@@ -444,7 +444,9 @@ async def test_serialization_after_execution_never_reexecutes_operation(
 
 
 @pytest.mark.parametrize("failure", ["json", "network", "close", "cancel"])
-async def test_uncommitted_stream_has_no_listener_events_and_rolls_back(hass, failure):
+async def test_uncommitted_stream_rolls_back_history_but_text_remains_emitted(
+    hass, failure
+):
     stream = _Stream(
         _chunk(text="Already completed private-token."),
         _chunk(_tool("{" if failure == "json" else "{}"), finish="tool_calls"),
@@ -472,7 +474,11 @@ async def test_uncommitted_stream_has_no_listener_events_and_rolls_back(hass, fa
         await entity._async_handle_chat_log(log, [tool_config()], [])
 
     assert log.content == checkpoint
-    log.delta_listener.assert_not_called()
+    assert [
+        call.args[1]["content"]
+        for call in log.delta_listener.call_args_list
+        if "content" in call.args[1]
+    ] == ["Already completed private-token."]
     stream.close.assert_awaited_once()
     assert create.await_count == 1
 

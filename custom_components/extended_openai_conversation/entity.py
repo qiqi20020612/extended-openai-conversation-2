@@ -639,9 +639,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     # JSON, missing identities or an unfinished argument stream.
                     if response.has_tool_calls:
                         tool_rounds += 1
-                    # The validator closes tool-enabled streams before publishing.
-                    if not tools:
-                        await stream.close()
+                    await stream.close()
                 response_committed = True
             except ParseArgumentsFailed as err:
                 # HA may have streamed text, but no tool in this response has
@@ -848,30 +846,17 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         completed_ids: dict[str, tuple[str, str]],
         response: _ToolCallResponse,
     ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
-        """Reuse atomic validation before any tool-enabled response reaches Assist."""
-        try:
-            deltas = [
-                delta
-                async for delta in self._transform_stream(chat_log, stream, response)
-            ]
-        finally:
-            await stream.close()
-        tool_calls = [
-            tool_call
-            for delta in deltas
-            for tool_call in delta.get("tool_calls", []) or []
-        ]
+        """Stream text immediately; validate complete tool calls before execution."""
+        tool_calls: list[llm.ToolInput] = []
+        async for delta in self._transform_stream(chat_log, stream, response):
+            tool_calls.extend(delta.get("tool_calls", []) or [])
+            yield delta
         if not tool_calls and not response.content:
             raise ParseArgumentsFailed("", reason="empty_response")
         for tool_call in tool_calls:
             completed_key = completed_ids.get(tool_call.id)
             if completed_key is not None and completed_key != _tool_call_key(tool_call):
                 raise ParseArgumentsFailed("", reason="invalid_tool_call_id")
-        # A preamble must not announce success before tools run. Failed streams
-        # published no role/content/native, so each valid response starts once.
-        for delta in deltas:
-            if not tool_calls or "content" not in delta:
-                yield delta
 
     async def _transform_stream(
         self,

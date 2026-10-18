@@ -1006,7 +1006,7 @@ async def test_real_sdk_sends_unmodified_argument_string_and_paired_error(hass):
     assert log.content[-1].content == "Finished."
 
 
-async def test_streamed_text_and_native_are_not_replayed_during_correction(hass):
+async def test_correction_preserves_live_text_and_accepted_native_metadata(hass):
     signature = {"google": {"thought_signature": "accepted-signature"}}
     failed = _Stream(_chunk(text="Working."), _chunk(_tool("{"), finish="tool_calls"))
     repaired = _Stream(
@@ -1018,9 +1018,13 @@ async def test_streamed_text_and_native_are_not_replayed_during_correction(hass)
     await _run(entity, log)
 
     deltas = [c.args[1] for c in log.delta_listener.call_args_list]
-    assert [d["content"] for d in deltas if "content" in d] == ["Finished."]
-    assert sum(d.get("role") == "assistant" for d in deltas) == 2
-    assert log.content[2].content is None
+    assert [d["content"] for d in deltas if "content" in d] == [
+        "Working.",
+        "Working.",
+        "Finished.",
+    ]
+    assert sum(d.get("role") == "assistant" for d in deltas) == 3
+    assert log.content[2].content == "Working."
     assert log.content[2].native == {
         "tool_call_extra_content_by_id": {"call_1": signature}
     }
