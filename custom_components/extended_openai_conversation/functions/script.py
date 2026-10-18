@@ -12,6 +12,7 @@ from homeassistant.helpers.script import Script
 
 from ..const import DOMAIN
 from .base import Function
+from .errors import execution_error
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,10 +37,14 @@ class ScriptFunction(Function):
             DOMAIN,
             running_description="[extended_openai_conversation] function",
             logger=_LOGGER,
+            log_exceptions=False,
         )
 
         context = llm_context.context if llm_context else None
         result = await script.async_run(run_variables=arguments, context=context)
         if result is None:
-            return "Success"
+            # HA returns None when a run was refused (shutdown/mode/recursion).
+            return execution_error(
+                RuntimeError(), status="not_executed", retryable=False
+            )
         return result.variables.get("_function_result", "Success")

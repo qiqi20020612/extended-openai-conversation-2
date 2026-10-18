@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import logging
 import os
 import sqlite3
@@ -16,6 +17,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import llm
 from homeassistant.helpers.template import Template
 
+from ..exceptions import InvalidFunction
 from .base import Function
 
 _LOGGER = logging.getLogger(__name__)
@@ -61,6 +63,9 @@ class SqliteFunction(Function):
 
     def set_url_read_only(self, url: str) -> str:
         scheme, netloc, path, query_string, fragment = parse.urlsplit(url)
+        if scheme not in {"", "file"}:
+            raise InvalidFunction("sqlite")
+        scheme = "file"
         query_params = parse.parse_qs(query_string)
 
         query_params["mode"] = ["ro"]
@@ -82,6 +87,7 @@ class SqliteFunction(Function):
         query = function_config.get("query", "{{query}}")
 
         template_arguments = {
+            **arguments,
             "is_exposed": lambda e: self.is_exposed(e, exposed_entities),
             "is_exposed_entity_in_query": lambda q: self.is_exposed_entity_in_query(
                 q, exposed_entities
@@ -89,23 +95,18 @@ class SqliteFunction(Function):
             "exposed_entities": exposed_entities,
             "raise": self.raise_error,
         }
-        template_arguments.update(arguments)
-
         q = Template(query, hass).async_render(template_arguments)
-        _LOGGER.info("Rendered query: %s", q)
+        _LOGGER.debug("SQLite query prepared (length=%s)", len(q))
 
-        with sqlite3.connect(db_url, uri=True) as conn:
-            cursor = conn.cursor().execute(q)
-            names = [description[0] for description in cursor.description]
+        def run_query() -> dict[str, Any] | list[dict[str, Any]]:
+            with closing(sqlite3.connect(db_url, uri=True)) as conn, conn:
+                cursor = conn.cursor().execute(q)
+                names = [description[0] for description in cursor.description or []]
+                if function_config.get("single") is True:
+                    row = cursor.fetchone()
+                    return {} if row is None else dict(zip(names, row, strict=False))
+                return [
+                    dict(zip(names, row, strict=False)) for row in cursor.fetchall()
+                ]
 
-            if function_config.get("single") is True:
-                row = cursor.fetchone()
-                return {name: val for name, val in zip(names, row, strict=False)}
-
-            rows = cursor.fetchall()
-            result = []
-            for row in rows:
-                result.append(
-                    {name: val for name, val in zip(names, row, strict=False)}
-                )
-            return result
+        return await hass.async_add_executor_job(run_query)

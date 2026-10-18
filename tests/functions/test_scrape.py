@@ -25,20 +25,12 @@ class TestScrapeFunctionYaml:
         function_tool = prepare_function_tool_from_yaml("scrape_example.yaml")
         function_config = function_tool["function"]
 
-        with (
-            patch(
-                "custom_components.extended_openai_conversation.functions.web.rest.create_rest_data_from_config"
-            ) as mock_rest,
-            patch(
-                "custom_components.extended_openai_conversation.functions.web.scrape.coordinator.ScrapeCoordinator"
-            ) as mock_coordinator_class,
-        ):
-            from bs4 import BeautifulSoup
-
+        with patch(
+            "custom_components.extended_openai_conversation.functions.web.rest.create_rest_data_from_config"
+        ) as mock_rest:
             mock_rest_data = AsyncMock()
             mock_rest.return_value = mock_rest_data
 
-            mock_coordinator = AsyncMock()
             # Mock Hacker News HTML structure
             html = """
             <html>
@@ -56,9 +48,9 @@ class TestScrapeFunctionYaml:
                 </tr>
             </html>
             """
-            mock_coordinator.data = BeautifulSoup(html, "html.parser")
-            mock_coordinator.async_config_entry_first_refresh = AsyncMock()
-            mock_coordinator_class.return_value = mock_coordinator
+            mock_rest_data.data = html
+            mock_rest_data.headers = {"Content-Type": "text/html"}
+            mock_rest_data.last_exception = None
 
             # Arguments based on yaml spec parameters (category is optional)
             arguments = {}
@@ -69,3 +61,4 @@ class TestScrapeFunctionYaml:
 
             # Should return scraped data
             assert result is not None
+            mock_rest_data.async_update.assert_awaited_once_with(log_errors=False)
