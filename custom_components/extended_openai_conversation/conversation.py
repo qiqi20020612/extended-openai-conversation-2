@@ -20,7 +20,6 @@ from homeassistant.components.conversation import (
 )
 from homeassistant.const import MATCH_ALL
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import intent, llm, template
 from homeassistant.helpers.chat_session import async_get_chat_session
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -125,23 +124,14 @@ class ExtendedOpenAIAgentEntity(
         # Create LLM context
         llm_context = user_input.as_llm_context(DOMAIN)
 
-        # Get exposed entities for function tools
-        exposed_entities = self._get_exposed_entities()
-
-        # Get function tools
-        function_tools = self._get_function_tools()
-
-        # Build custom prompt with exposed entities
-        system_prompt = self._build_system_prompt(
-            exposed_entities, llm_context, user_input
-        )
-
-        # Set system prompt in chat log
-        chat_log.content[0] = conversation.SystemContent(content=system_prompt)
-
-        # Call the LLM
-
         try:
+            # Static configuration failures are terminal, not tool-error retries.
+            exposed_entities = self._get_exposed_entities()
+            function_tools = self._get_function_tools()
+            system_prompt = self._build_system_prompt(
+                exposed_entities, llm_context, user_input
+            )
+            chat_log.content[0] = conversation.SystemContent(content=system_prompt)
             await self._async_handle_chat_log(
                 chat_log,
                 function_tools=function_tools,
@@ -156,19 +146,30 @@ class ExtendedOpenAIAgentEntity(
                 intent.IntentResponseErrorCode.UNKNOWN,
                 f"Sorry, I had a problem talking to OpenAI ({type(err).__name__}).",
             )
-            return conversation.ConversationResult(
-                response=intent_response, conversation_id=user_input.conversation_id
-            )
-        except HomeAssistantError as err:
-            _LOGGER.error("Error during conversation: %s", err, exc_info=True)
-            error_message = f"Something went wrong: {err}"
-            argument_error = isinstance(err, ParseArgumentsFailed)
-            if argument_error:
-                chat_log.async_add_assistant_content_without_tools(
-                    conversation.AssistantContent(
-                        agent_id=self.entity_id, content=error_message
-                    )
+            chat_log.async_add_assistant_content_without_tools(
+                conversation.AssistantContent(
+                    agent_id=self.entity_id, content="The model service request failed."
                 )
+            )
+            return conversation.ConversationResult(
+                response=intent_response, conversation_id=chat_log.conversation_id
+            )
+        except Exception as err:
+            # This is a terminal boundary, never a retry. Cancellation/SystemExit
+            # are BaseExceptions; resource exhaustion and shutdown also propagate.
+            if isinstance(err, (MemoryError, RecursionError)) or self.hass.is_stopping:
+                raise
+            _LOGGER.error("Conversation failed (%s)", type(err).__name__)
+            error_message = (
+                str(err)
+                if isinstance(err, ParseArgumentsFailed)
+                else f"The conversation could not be completed ({type(err).__name__})."
+            )
+            chat_log.async_add_assistant_content_without_tools(
+                conversation.AssistantContent(
+                    agent_id=self.entity_id, content=error_message
+                )
+            )
             intent_response = intent.IntentResponse(language=user_input.language)
             intent_response.async_set_error(
                 intent.IntentResponseErrorCode.UNKNOWN,
@@ -176,11 +177,7 @@ class ExtendedOpenAIAgentEntity(
             )
             return conversation.ConversationResult(
                 response=intent_response,
-                conversation_id=(
-                    chat_log.conversation_id
-                    if argument_error
-                    else user_input.conversation_id
-                ),
+                conversation_id=chat_log.conversation_id,
             )
 
         # Fire conversation finished event
@@ -251,17 +248,35 @@ class ExtendedOpenAIAgentEntity(
                 else DEFAULT_CONF_FUNCTION_TOOLS
             )
             if function_tools:
+                if not isinstance(function_tools, list):
+                    raise FunctionLoadFailed()
+                names: set[str] = set()
                 for function_tool in function_tools:
-                    if isinstance(function_tool, dict) and "function" in function_tool:
-                        function_config = function_tool["function"]
-                        if (
-                            isinstance(function_config, dict)
-                            and "type" in function_config
-                        ):
-                            function = get_function(function_config["type"])
-                            function_tool["function"] = function.validate_schema(
-                                function_config
-                            )
+                    if not isinstance(function_tool, dict):
+                        raise FunctionLoadFailed()
+                    spec = function_tool.get("spec")
+                    config = function_tool.get("function")
+                    if not isinstance(spec, dict) or not isinstance(config, dict):
+                        raise FunctionLoadFailed()
+                    name = spec.get("name")
+                    parameters = spec.get("parameters", {})
+                    if (
+                        not isinstance(name, str)
+                        or not name
+                        or name in names
+                        or not isinstance(parameters, dict)
+                        or not isinstance(parameters.get("properties", {}), dict)
+                        or not isinstance(parameters.get("required", []), list)
+                        or any(
+                            not isinstance(key, str)
+                            for key in parameters.get("required", [])
+                        )
+                        or "type" not in config
+                    ):
+                        raise FunctionLoadFailed()
+                    names.add(name)
+                    function = get_function(config["type"])
+                    function_tool["function"] = function.validate_schema(config)
 
             return function_tools or []
         except (InvalidFunction, FunctionNotFound) as e:

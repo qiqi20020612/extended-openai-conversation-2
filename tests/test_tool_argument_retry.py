@@ -368,9 +368,10 @@ async def test_correction_does_not_schedule_completed_background_tool_again(
     await _run(entity, log)
 
     entity.entry.async_create_task.assert_called_once()
-    assert function.execute.call_count == 2
+    assert function.execute.call_count == 1
     assert function.execute.await_count == 1
-    assert _tool_result_data(_results(log)[1]) == {"result": "Scheduled"}
+    assert _tool_result_data(_results(log)[1])["result"] == "Scheduled"
+    assert _tool_result_data(_results(log)[1])["execution_status"] == "scheduled"
 
 
 @pytest.mark.parametrize("limit", [1, 2, 3, 10, -1])
@@ -719,18 +720,29 @@ async def test_other_stream_failures_are_not_argument_retried(hass, failure):
 @pytest.mark.parametrize(
     "error_type", [ParseArgumentsFailed, vol.Invalid, HomeAssistantError]
 )
-async def test_executor_errors_never_restart_generation(
+async def test_executor_errors_are_results_not_argument_retries(
     hass, after_correction, error_type
 ):
-    streams = ([_calls(_tool("{"))] if after_correction else []) + [_calls(_tool("{}"))]
-    entity, log, create = _setup(hass, streams)
+    streams = ([_calls(_tool("{"))] if after_correction else []) + [
+        _calls(_tool("{}")),
+        _answer(),
+    ]
+    entity, log, create = _setup(
+        hass,
+        streams,
+        options={"max_function_calls_per_conversation": 2 if after_correction else 1},
+    )
     entity._execute_function_tool.side_effect = error_type("private executor data")
 
-    with pytest.raises(error_type):
-        await _run(entity, log)
+    await _run(entity, log)
 
     assert create.await_count == len(streams)
     entity._execute_function_tool.assert_awaited_once()
+    assert _results(log)[0].result.error
+    assert _tool_result_data(_results(log)[0])["error"] == error_type.__name__
+    assert _tool_result_data(_results(log)[0])["execution_status"] == "unknown"
+    assert log.content[-1].content == "Finished."
+    assert create.await_args.kwargs["tool_choice"] == "none"
 
 
 @pytest.mark.parametrize(
@@ -994,7 +1006,7 @@ async def test_real_sdk_sends_unmodified_argument_string_and_paired_error(hass):
     assert log.content[-1].content == "Finished."
 
 
-async def test_streamed_text_and_native_are_not_replayed_during_correction(hass):
+async def test_correction_preserves_live_text_and_accepted_native_metadata(hass):
     signature = {"google": {"thought_signature": "accepted-signature"}}
     failed = _Stream(_chunk(text="Working."), _chunk(_tool("{"), finish="tool_calls"))
     repaired = _Stream(
@@ -1006,9 +1018,13 @@ async def test_streamed_text_and_native_are_not_replayed_during_correction(hass)
     await _run(entity, log)
 
     deltas = [c.args[1] for c in log.delta_listener.call_args_list]
-    assert [d["content"] for d in deltas if "content" in d] == ["Working.", "Finished."]
-    assert sum(d.get("role") == "assistant" for d in deltas) == 2
-    assert log.content[2].content is None
+    assert [d["content"] for d in deltas if "content" in d] == [
+        "Working.",
+        "Working.",
+        "Finished.",
+    ]
+    assert sum(d.get("role") == "assistant" for d in deltas) == 3
+    assert log.content[2].content == "Working."
     assert log.content[2].native == {
         "tool_call_extra_content_by_id": {"call_1": signature}
     }
@@ -1129,5 +1145,5 @@ async def test_backend_rejecting_feedback_cannot_echo_sensitive_arguments(hass, 
     assert secret not in str(result.as_dict())
     assert secret not in caplog.text
     assert "BadRequestError" in caplog.text
-    assert [c.role for c in log.content] == ["system", "user"]
+    assert [c.role for c in log.content] == ["system", "user", "assistant"]
     _assert_paired_tools(create.await_args_list[1].kwargs["messages"])

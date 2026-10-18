@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from collections.abc import AsyncGenerator
+from copy import deepcopy
 from dataclasses import dataclass, field
 import json
 import logging
 from mimetypes import guess_file_type
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from openai import AsyncClient, AsyncStream
 from openai.types.chat import (
@@ -57,8 +59,23 @@ from .const import (
     DEFAULT_TOP_P,
     DOMAIN,
 )
-from .exceptions import FunctionNotFound, ParseArgumentsFailed, TokenLengthExceededError
+from .exceptions import (
+    FunctionNotFound,
+    InvalidFunction,
+    ParseArgumentsFailed,
+    TokenLengthExceededError,
+)
 from .functions import get_function
+from .functions.errors import (
+    EXPECTED_TOOL_ERRORS,
+    UNCONFIRMED_OPERATION_MESSAGE,
+    execution_error,
+    function_is_read_only,
+    is_fatal_error,
+    result_blocks_replay,
+    result_is_error,
+)
+from .functions.native import service_operation_keys
 from .helpers import get_model_config
 
 if TYPE_CHECKING:
@@ -88,6 +105,44 @@ class _ToolCallResponse:
 def _tool_call_key(tool_input: llm.ToolInput) -> tuple[str, str]:
     """Identify a completed call when a correction changes its provider ID."""
     return tool_input.tool_name, json.dumps(tool_input.tool_args, sort_keys=True)
+
+
+def _tool_operation_scopes(
+    hass: HomeAssistant, function_tool: dict[str, Any] | None, tool_input: llm.ToolInput
+) -> list[set[tuple[str, ...]]]:
+    """Resolve service actions/targets before dispatch; do not guess script effects.
+
+    A batch retains one scope per member so an explicitly unexecuted member can
+    be corrected, while completed/unknown members cannot be replayed in a new batch.
+    No target identities or argument values are added to results or diagnostics.
+    """
+    config = function_tool["function"] if function_tool else {}
+    name = config.get("name")
+    if config.get("type") != "native" or name not in {
+        "execute_service",
+        "execute_service_single",
+    }:
+        # Arbitrary scripts/composites can affect targets absent from their input.
+        # Different arguments alone cannot establish that their effects are disjoint.
+        return [{("configured_tool", tool_input.tool_name)}]
+    arguments = (
+        tool_input.tool_args.get("list", [])
+        if name == "execute_service"
+        else [tool_input.tool_args]
+    )
+    if not isinstance(arguments, list):
+        return []  # The executor will report the invalid input without dispatching.
+    scopes: list[set[tuple[str, ...]]] = []
+    for argument in arguments:
+        try:
+            scope = service_operation_keys(hass, vol.Schema(dict)(argument))
+        except EXPECTED_TOOL_ERRORS as err:
+            if is_fatal_error(err) or hass.is_stopping:
+                raise
+            scopes.append(set())
+            continue
+        scopes.append(scope)
+    return scopes
 
 
 def _shorten_tool_call_id(tool_call_id: str) -> str:
@@ -216,7 +271,12 @@ def _format_structured_output(
 
 
 def _make_tool_result_content(
-    agent_id: str, tool_call_id: str, tool_name: str, data: dict[str, Any]
+    agent_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    data: dict[str, Any],
+    *,
+    error: bool = False,
 ) -> conversation.ToolResultContent:
     """Build a ToolResultContent across HA versions.
 
@@ -225,7 +285,7 @@ def _make_tool_result_content(
     """
     tool_result_cls = getattr(llm, "ToolResult", None)
     payload: dict[str, Any] = (
-        {"result": tool_result_cls(data=data)}
+        {"result": tool_result_cls(data=data, error=error)}
         if tool_result_cls is not None
         else {"tool_result": data}
     )
@@ -240,6 +300,14 @@ def _tool_result_data(content: conversation.ToolResultContent) -> Any:
     if result is not None:
         return result.data
     return content.tool_result
+
+
+def _tool_result(content: conversation.ToolResultContent) -> llm.ToolResult:
+    """Read the native result, retaining error flags when replaying it."""
+    result = getattr(content, "result", None)
+    if result is not None:
+        return cast(llm.ToolResult, result)
+    return llm.ToolResult(data=content.tool_result)
 
 
 def _render_extra_body(
@@ -260,7 +328,11 @@ def _render_extra_body(
             parse_result=False
         )
     except TemplateError as err:
-        _LOGGER.warning("Invalid extra_body template for %s, ignoring: %s", model, err)
+        _LOGGER.warning(
+            "Invalid extra_body template for %s, ignoring (%s)",
+            model,
+            type(err).__name__,
+        )
         return None
 
     if not rendered.strip():
@@ -270,7 +342,9 @@ def _render_extra_body(
         parsed: dict[str, Any] = json.loads(rendered)
         return parsed
     except json.JSONDecodeError as err:
-        _LOGGER.warning("Invalid extra_body JSON for %s, ignoring: %s", model, err)
+        _LOGGER.warning(
+            "Invalid extra_body JSON for %s, ignoring (%s)", model, type(err).__name__
+        )
         return None
 
 
@@ -552,6 +626,9 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         tool_rounds = 0
         completed_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
         completed_ids: dict[str, tuple[str, str]] = {}
+        results_by_id: dict[str, conversation.ToolResultContent] = {}
+        blocked_operations: dict[tuple[str, ...], conversation.ToolResultContent] = {}
+        denied_functions: dict[str, conversation.ToolResultContent] = {}
         retrying = False
         replay_results: dict[tuple[str, str], conversation.ToolResultContent] = {}
         request_messages = messages
@@ -575,13 +652,14 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             )
             pending_tool_calls: list[llm.ToolInput] = []
             response = _ToolCallResponse()
+            response_committed = False
             try:
                 try:
                     deltas = (
                         self._validated_retry_stream(
                             chat_log, stream, completed_ids, response
                         )
-                        if retrying
+                        if tools
                         else self._transform_stream(chat_log, stream, response)
                     )
                     async for content in chat_log.async_add_delta_content_stream(
@@ -603,6 +681,7 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     if response.has_tool_calls:
                         tool_rounds += 1
                     await stream.close()
+                response_committed = True
             except ParseArgumentsFailed as err:
                 # HA may have streamed text, but no tool in this response has
                 # run. Restore only this request's checkpoint, never the turn.
@@ -636,6 +715,9 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     *_tool_error_messages(response, shorten_tool_call_id),
                 ]
                 continue
+            finally:
+                if not response_committed:
+                    chat_log.content[:] = history_before_request
 
             if retrying:
                 _LOGGER.debug("Tool argument correction succeeded")
@@ -645,42 +727,170 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
                     "Response includes %s tool calls", len(pending_tool_calls)
                 )
 
-            # Execute custom functions
-            for tool_input in pending_tool_calls:
-                function_tool = next(
-                    (
-                        f
-                        for f in (function_tools)
-                        if f["spec"]["name"] == tool_input.tool_name
-                    ),
-                    None,
-                )
-
-                if function_tool is None:
-                    raise FunctionNotFound(tool_input.tool_name)
-
-                call_key = _tool_call_key(tool_input)
-                if (previous_result := replay_results.get(call_key)) is not None:
-                    # Only the correction response reuses earlier successes.
-                    # New IDs still need a matching result in the protocol.
+            # Permission denials retain the existing per-tool boundary. Uncertain
+            # service effects protect only overlapping actions/targets, including
+            # overlaps inside one response; unrelated calls remain independent.
+            denied_before_batch = denied_functions.copy()
+            answered: set[str] = set()
+            active_tool: llm.ToolInput | None = None
+            batch_has_error = False
+            try:
+                for tool_input in pending_tool_calls:
+                    if self.hass.is_stopping:
+                        raise HomeAssistantError("Home Assistant is stopping")
+                    call_key = _tool_call_key(tool_input)
+                    function_tool = next(
+                        (
+                            f
+                            for f in function_tools
+                            if f["spec"]["name"] == tool_input.tool_name
+                        ),
+                        None,
+                    )
+                    operation_scopes = _tool_operation_scopes(
+                        self.hass, function_tool, tool_input
+                    )
+                    blocked = denied_before_batch.get(tool_input.tool_name) or next(
+                        (
+                            blocked_operations[key]
+                            for scope in operation_scopes
+                            for key in scope
+                            if key in blocked_operations
+                        ),
+                        None,
+                    )
+                    previous_result = results_by_id.get(tool_input.id)
+                    cached = completed_results.get(call_key)
+                    if (
+                        previous_result is None
+                        and cached is not None
+                        and (
+                            call_key in replay_results
+                            or result_blocks_replay(_tool_result(cached))
+                        )
+                    ):
+                        previous_result = cached
+                    if previous_result is not None:
+                        outcome = _tool_result(previous_result)
+                        _LOGGER.debug("Reusing recorded tool result")
+                    elif blocked is not None:
+                        previous = _tool_result(blocked)
+                        denied = bool(previous.data.get("permission_denied"))
+                        outcome = llm.ToolResult(
+                            data={
+                                "error": "UnsafeRetryBlocked",
+                                "error_text": "Access denied by the configured permissions."
+                                if denied
+                                else UNCONFIRMED_OPERATION_MESSAGE,
+                                "execution_status": "not_executed",
+                                "retryable": False,
+                                "previous_execution_status": previous.data.get(
+                                    "execution_status"
+                                ),
+                                "requires_state_check": not denied,
+                                "permission_denied": denied,
+                            },
+                            error=True,
+                        )
+                    elif function_tool is None:
+                        outcome = execution_error(
+                            FunctionNotFound(tool_input.tool_name),
+                            status="not_executed",
+                        )
+                    else:
+                        active_tool = tool_input
+                        try:
+                            content = await self._execute_function_tool(
+                                function_tool, tool_input, llm_context, exposed_entities
+                            )
+                            outcome = _tool_result(content)
+                        except EXPECTED_TOOL_ERRORS as err:
+                            if is_fatal_error(err) or self.hass.is_stopping:
+                                raise
+                            outcome = execution_error(err)
+                            _LOGGER.warning(
+                                "Tool execution failed (%s)", type(err).__name__
+                            )
+                    if outcome.error and outcome.data.get("execution_status") in {
+                        "unknown",
+                        "partial",
+                    }:
+                        outcome.data["retryable"] = False
+                        outcome.data["requires_state_check"] = True
+                        outcome.data["recovery_action"] = UNCONFIRMED_OPERATION_MESSAGE
                     tool_result_content = _make_tool_result_content(
                         self.entity_id,
                         tool_input.id,
                         tool_input.tool_name,
-                        _tool_result_data(previous_result),
+                        outcome.data,
+                        error=outcome.error,
                     )
-                    _LOGGER.debug("Reusing completed tool result during correction")
-                else:
-                    tool_result_content = await self._execute_function_tool(
-                        function_tool,
-                        tool_input,
-                        llm_context,
-                        exposed_entities,
-                    )
-
-                chat_log.async_add_assistant_content_without_tools(tool_result_content)
-                completed_results[call_key] = tool_result_content
-                completed_ids[tool_input.id] = call_key
+                    # Record before notifying listeners: an observer failure must
+                    # never result in a second side effect or a duplicate result.
+                    answered.add(tool_input.id)
+                    completed_ids[tool_input.id] = call_key
+                    results_by_id[tool_input.id] = tool_result_content
+                    if not outcome.error or result_blocks_replay(outcome):
+                        completed_results[call_key] = tool_result_content
+                    if outcome.data.get("permission_denied"):
+                        denied_functions[tool_input.tool_name] = tool_result_content
+                    if outcome.data.get("execution_status") in {
+                        "unknown",
+                        "partial",
+                    }:
+                        member_results = (
+                            outcome.data.get("results")
+                            if function_tool is not None
+                            and function_tool["function"].get("type") == "native"
+                            and function_tool["function"].get("name")
+                            == "execute_service"
+                            else None
+                        )
+                        for index, scope in enumerate(operation_scopes):
+                            # Native batches preserve an outcome per member. An
+                            # input rejected before dispatch remains safe to fix.
+                            member = (
+                                member_results[index]
+                                if isinstance(member_results, list)
+                                and len(member_results) == len(operation_scopes)
+                                else None
+                            )
+                            if isinstance(member, dict) and member.get(
+                                "execution_status"
+                            ) in {"not_executed", "failed"}:
+                                continue
+                            for key in scope:
+                                blocked_operations[key] = tool_result_content
+                    batch_has_error |= outcome.error
+                    self._add_tool_result(chat_log, tool_result_content)
+                    active_tool = None
+            finally:
+                # No BaseException is swallowed. In-flight cancellation/fatal
+                # failures remain unknown; later calls were never executed.
+                for tool_input in pending_tool_calls:
+                    if tool_input.id not in answered:
+                        in_flight = (
+                            active_tool is not None and active_tool.id == tool_input.id
+                        )
+                        self._add_tool_result(
+                            chat_log,
+                            _make_tool_result_content(
+                                self.entity_id,
+                                tool_input.id,
+                                tool_input.tool_name,
+                                {
+                                    "error": "ExecutionInterrupted"
+                                    if in_flight
+                                    else "NotExecuted",
+                                    "execution_status": "unknown"
+                                    if in_flight
+                                    else "not_executed",
+                                    "retryable": False,
+                                    "requires_state_check": in_flight,
+                                },
+                                error=True,
+                            ),
+                        )
 
             # Update messages for next iteration
             messages = _convert_content_to_param(
@@ -690,9 +900,28 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
             # Check if we need to continue (if there are pending tool results)
             if not chat_log.unresponded_tool_results:
                 break
-            retrying = False
-            replay_results = {}
+            retrying = batch_has_error
+            replay_results = completed_results.copy() if retrying else {}
             request_messages = messages
+
+    def _add_tool_result(
+        self, chat_log: conversation.ChatLog, content: conversation.ToolResultContent
+    ) -> None:
+        """Publish external results through HA's API and its streaming listener."""
+        before = len(chat_log.content)
+        try:
+            chat_log.async_add_assistant_content_without_tools(content)
+        except Exception as err:
+            if len(chat_log.content) == before or is_fatal_error(err):
+                raise
+            _LOGGER.warning("Tool result observer failed (%s)", type(err).__name__)
+        if chat_log.delta_listener:
+            try:
+                chat_log.delta_listener(chat_log, content.as_dict())
+            except Exception as err:
+                if is_fatal_error(err):
+                    raise
+                _LOGGER.warning("Tool result listener failed (%s)", type(err).__name__)
 
     async def _validated_retry_stream(
         self,
@@ -701,26 +930,17 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         completed_ids: dict[str, tuple[str, str]],
         response: _ToolCallResponse,
     ) -> AsyncGenerator[conversation.AssistantContentDeltaDict]:
-        """Validate the entire correction before exposing any more deltas to HA."""
-        deltas = [
-            delta async for delta in self._transform_stream(chat_log, stream, response)
-        ]
-        tool_calls = [
-            tool_call
-            for delta in deltas
-            for tool_call in delta.get("tool_calls", []) or []
-        ]
+        """Stream text immediately; validate complete tool calls before execution."""
+        tool_calls: list[llm.ToolInput] = []
+        async for delta in self._transform_stream(chat_log, stream, response):
+            tool_calls.extend(delta.get("tool_calls", []) or [])
+            yield delta
         if not tool_calls and not response.content:
             raise ParseArgumentsFailed("", reason="empty_response")
         for tool_call in tool_calls:
             completed_key = completed_ids.get(tool_call.id)
             if completed_key is not None and completed_key != _tool_call_key(tool_call):
                 raise ParseArgumentsFailed("", reason="invalid_tool_call_id")
-        # Do not repeat a tool-call preamble. A text-only response (for example
-        # a clarification or refusal) is the model's decision and is accepted.
-        for delta in deltas:
-            if "role" not in delta and (not tool_calls or "content" not in delta):
-                yield delta
 
     async def _transform_stream(
         self,
@@ -914,38 +1134,148 @@ class ExtendedOpenAIBaseLLMEntity(Entity):
         exposed_entities: list[dict[str, Any]],
     ) -> conversation.ToolResultContent:
         """Execute a custom function."""
-        arguments: dict[str, Any] = tool_input.tool_args
+        arguments: dict[str, Any] = deepcopy(tool_input.tool_args)
         function_config = function_tool["function"]
-        function = get_function(function_config["type"])
-
-        if self.should_run_in_background(arguments):
+        try:
+            function = get_function(function_config["type"])
+        except (KeyError, FunctionNotFound) as err:
+            raise InvalidFunction("configured tool") from err
+        missing = [
+            name
+            for name in function_tool["spec"].get("parameters", {}).get("required", [])
+            if name not in arguments
+        ]
+        if missing:
+            outcome = execution_error(KeyError(), status="not_executed")
+            outcome.data["missing_parameters"] = missing
+        elif self.should_run_in_background(arguments):
             # create a delayed function and execute in background
             function_config = self.get_delayed_function_config(
                 function_config, arguments
             )
-            function = get_function(function_config["type"])
-            self.entry.async_create_task(
-                self.hass,
-                function.execute(
-                    self.hass,
-                    function_config,
-                    arguments,
-                    llm_context,
-                    exposed_entities,
-                ),
-            )
-            result = "Scheduled"
+            try:
+                # Only the new delay is unvalidated. Revalidating the original
+                # function would reject templates HA has already compiled.
+                function_config["sequence"][0] = get_function("script").validate_schema(
+                    function_config["sequence"][0]
+                )
+            except InvalidFunction as err:
+                cause = err.__cause__
+                outcome = execution_error(
+                    cause if isinstance(cause, Exception) else ValueError(),
+                    status="not_executed",
+                )
+            else:
+                coroutine = self._async_run_background_tool(
+                    function_config, arguments, llm_context, exposed_entities
+                )
+                try:
+                    self.entry.async_create_task(self.hass, coroutine)
+                except Exception:
+                    coroutine.close()
+                    raise
+                outcome = llm.ToolResult(
+                    data={
+                        "result": "Scheduled",
+                        "execution_status": "scheduled",
+                        "completion_confirmed": False,
+                        "retryable": False,
+                    }
+                )
         else:
-            result = await function.execute(
-                self.hass, function_config, arguments, llm_context, exposed_entities
-            )
+            try:
+                result = await function.execute(
+                    self.hass, function_config, arguments, llm_context, exposed_entities
+                )
+            except EXPECTED_TOOL_ERRORS as err:
+                if is_fatal_error(err) or self.hass.is_stopping:
+                    raise
+                outcome = execution_error(
+                    err,
+                    status="failed"
+                    if function_is_read_only(function_config)
+                    else "unknown",
+                )
+                _LOGGER.warning("Tool execution failed (%s)", type(err).__name__)
+            else:
+                try:
+                    if isinstance(result, llm.ToolResult):
+                        outcome = result
+                    elif result_is_error(result, function_config):
+                        data = (
+                            result if isinstance(result, dict) else {"results": result}
+                        )
+                        # Preserve legacy error fields; add only execution metadata.
+                        outcome = llm.ToolResult(data=dict(data), error=True)
+                    else:
+                        outcome = llm.ToolResult(data={"result": str(result)})
+                    if outcome.error and (
+                        "execution_status" not in outcome.data
+                        or outcome.data.get("execution_status")
+                        in {"unknown", "partial"}
+                    ):
+                        data = dict(outcome.data)
+                        read_only = function_is_read_only(function_config)
+                        data.setdefault(
+                            "execution_status", "failed" if read_only else "unknown"
+                        )
+                        data.setdefault("retryable", read_only)
+                        if data["execution_status"] in {"unknown", "partial"}:
+                            data["retryable"] = False
+                            data.setdefault("requires_state_check", True)
+                        outcome = llm.ToolResult(data=data, error=True)
+                    orjson.dumps(outcome.data)
+                except Exception as err:
+                    if is_fatal_error(err):
+                        raise
+                    outcome = llm.ToolResult(
+                        data={
+                            "error": "ResultSerializationError",
+                            "execution_status": "unknown",
+                            "retryable": False,
+                            "requires_state_check": True,
+                        },
+                        error=True,
+                    )
+                    _LOGGER.warning(
+                        "Tool result serialization failed (%s)", type(err).__name__
+                    )
 
         return _make_tool_result_content(
             agent_id=self.entity_id,
             tool_call_id=tool_input.id,
             tool_name=tool_input.tool_name,
-            data={"result": str(result)},
+            data=outcome.data,
+            error=outcome.error,
         )
+
+    async def _async_run_background_tool(
+        self,
+        function_config: dict[str, Any],
+        arguments: dict[str, Any],
+        llm_context: llm.LLMContext | None,
+        exposed_entities: list[dict[str, Any]],
+    ) -> None:
+        """Observe delayed failures without mutating a completed conversation."""
+        try:
+            result = await get_function(function_config["type"]).execute(
+                self.hass, function_config, arguments, llm_context, exposed_entities
+            )
+            failed = result_is_error(result, function_config)
+            _LOGGER.log(
+                logging.WARNING if failed else logging.DEBUG,
+                "Background tool finished (status=%s)",
+                "failed_or_unknown" if failed else "completed",
+            )
+        except asyncio.CancelledError:
+            _LOGGER.debug("Background tool cancelled (outcome=unknown)")
+            raise
+        except Exception as err:
+            if is_fatal_error(err) or self.hass.is_stopping:
+                raise
+            _LOGGER.warning(
+                "Background tool failed (%s, outcome=unknown)", type(err).__name__
+            )
 
     def should_run_in_background(self, arguments: dict[str, Any]) -> bool:
         """Check if function needs delay."""

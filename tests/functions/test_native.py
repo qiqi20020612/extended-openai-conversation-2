@@ -11,6 +11,12 @@ from custom_components.extended_openai_conversation.functions import (
 )
 from tests.helpers import prepare_function_tool_from_yaml
 
+SERVICE_COMPLETED = {
+    "success": True,
+    "execution_status": "service_completed",
+    "device_state_confirmed": False,
+}
+
 
 class TestNativeFunctionYaml:
     """Test NativeFunction using yaml definitions."""
@@ -49,11 +55,13 @@ class TestNativeFunctionYaml:
             hass, function_config, arguments, llm_context, exposed_entities
         )
 
-        assert result == [{"success": True}]
+        assert result == [SERVICE_COMPLETED]
         hass.services.async_call.assert_called_once()
         call_args = hass.services.async_call.call_args
         assert call_args[1]["domain"] == "light"
         assert call_args[1]["service"] == "turn_on"
+        assert call_args[1]["blocking"] is True
+        assert call_args[1]["context"] is llm_context.context
 
     async def test_execute_service_with_defaults(
         self, hass, function, exposed_entities, llm_context
@@ -82,7 +90,7 @@ class TestNativeFunctionYaml:
             hass, function_config, arguments, llm_context, exposed_entities
         )
 
-        assert result == [{"success": True}]
+        assert result == [SERVICE_COMPLETED]
         hass.services.async_call.assert_called_once()
 
     async def test_execute_service_with_delay(
@@ -111,7 +119,7 @@ class TestNativeFunctionYaml:
             hass, function_config, arguments, llm_context, exposed_entities
         )
 
-        assert result == [{"success": True}]
+        assert result == [SERVICE_COMPLETED]
         hass.services.async_call.assert_called_once()
 
     async def test_execute_service_multiple_services(
@@ -142,7 +150,7 @@ class TestNativeFunctionYaml:
             hass, function_config, arguments, llm_context, exposed_entities
         )
 
-        assert result == [{"success": True}, {"success": True}]
+        assert result == [SERVICE_COMPLETED, SERVICE_COMPLETED]
         assert hass.services.async_call.call_count == 2
 
     async def test_execute_service_with_data_instead_of_service_data(
@@ -171,15 +179,13 @@ class TestNativeFunctionYaml:
             hass, function_config, arguments, llm_context, exposed_entities
         )
 
-        assert result == [{"success": True}]
+        assert result == [SERVICE_COMPLETED]
         hass.services.async_call.assert_called_once()
 
     async def test_execute_service_not_found_error(
         self, hass, function, exposed_entities, llm_context
     ):
         """Test service execution fails when service does not exist."""
-        from homeassistant.exceptions import ServiceNotFound
-
         function_tool = prepare_function_tool_from_yaml(
             "native_execute_service_example.yaml"
         )
@@ -198,10 +204,13 @@ class TestNativeFunctionYaml:
             ]
         }
 
-        with pytest.raises(ServiceNotFound):
-            await function.execute(
-                hass, function_config, arguments, llm_context, exposed_entities
-            )
+        result = await function.execute(
+            hass, function_config, arguments, llm_context, exposed_entities
+        )
+        assert result.error
+        assert result.data["results"][0]["error"] == "ServiceNotFound"
+        assert result.data["execution_status"] == "not_executed"
+        hass.services.async_call.assert_not_awaited()
 
 
 class TestNativeGetHistory:

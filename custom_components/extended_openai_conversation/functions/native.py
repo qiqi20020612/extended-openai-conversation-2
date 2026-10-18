@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
+from copy import deepcopy
 from datetime import timedelta
+from functools import partial
 import logging
 import os
+from threading import Lock
 import time
 from typing import Any
 
@@ -17,20 +22,134 @@ from homeassistant.config import AUTOMATION_CONFIG_PATH
 from homeassistant.const import SERVICE_RELOAD
 from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError, ServiceNotFound
-from homeassistant.helpers import llm
+from homeassistant.helpers import llm, service as ha_service, target
 import homeassistant.util.dt as dt_util
 
 from ..const import EVENT_AUTOMATION_REGISTERED
-from ..exceptions import CallServiceError, NativeNotFound
+from ..exceptions import (
+    CallServiceError,
+    EntityNotExposed,
+    EntityNotFound,
+    InvalidFunction,
+    NativeNotFound,
+)
 from .base import Function
+from .errors import (
+    EXPECTED_TOOL_ERRORS,
+    UNCONFIRMED_OPERATION_MESSAGE,
+    execution_error,
+    is_fatal_error,
+)
 
 _LOGGER = logging.getLogger(__name__)
+
+# Bound the Assist wait. A timeout never proves that an action did not happen.
+_SERVICE_CALL_TIMEOUT = 30
+
+# Executor jobs can outlive the awaiting conversation, including cancellation.
+# Hold a thread lock across the whole read/check/write transaction in the job.
+_AUTOMATION_STORAGE_LOCK = Lock()
+
+
+def service_call_arguments(
+    arguments: dict[str, Any],
+) -> tuple[str, str, dict[str, Any]]:
+    """Normalize the supported service argument forms without mutating input."""
+    domain = vol.Schema(str)(arguments["domain"])
+    service = vol.Schema(str)(arguments["service"])
+    data = deepcopy(
+        vol.Schema(dict)(arguments.get("service_data", arguments.get("data", {})))
+    )
+    entity_ids = data.get("entity_id", arguments.get("entity_id"))
+    if isinstance(entity_ids, str):
+        entity_ids = [item.strip() for item in entity_ids.split(",") if item.strip()]
+    if entity_ids is not None:
+        data["entity_id"] = vol.Schema([str])(entity_ids)
+    return domain, service, data
+
+
+def service_target_entities(
+    hass: HomeAssistant, domain: str, service: str, data: dict[str, Any]
+) -> set[str]:
+    """Use HA's effective target set for exposure and operation-overlap checks."""
+    selection = target.TargetSelection(data)
+    selected = target.async_extract_referenced_entity_ids(hass, selection)
+    if any(
+        (
+            selected.missing_areas,
+            selected.missing_devices,
+            selected.missing_floors,
+            selected.missing_labels,
+        )
+    ):
+        raise EntityNotFound("target")
+    all_entities = selected.referenced | selected.indirectly_referenced
+    registered_service = hass.services.async_services()[domain][service]
+    handler = registered_service.job.target
+    # Platform service domains can differ from the domains of their entities.
+    if isinstance(handler, partial) and handler.func in {
+        ha_service.entity_service_call,
+        ha_service.batched_entity_service_call,
+    }:
+        entities = (
+            handler.args[1]
+            if len(handler.args) > 1
+            else handler.keywords.get("registered_entities")
+        )
+        if callable(entities):
+            entities = entities()
+        if isinstance(entities, Mapping):
+            all_entities.intersection_update(entities)
+    elif domain == "homeassistant" and service in {"turn_on", "turn_off", "toggle"}:
+        all_entities = {
+            entity_id
+            for entity_id in all_entities
+            if (entity_domain := entity_id.partition(".")[0]) != domain
+            and hass.services.has_service(entity_domain, service)
+        }
+    # Unknown/custom handlers retain conservative checks of all targets.
+    return all_entities
+
+
+def service_operation_keys(
+    hass: HomeAssistant, arguments: dict[str, Any]
+) -> set[tuple[str, ...]]:
+    """Identify the same action through aliases and overlapping target selectors."""
+    domain, service, data = service_call_arguments(arguments)
+    return {
+        (
+            "ha_service",
+            entity_id.partition(".")[0]
+            if domain == "homeassistant"
+            and service in {"turn_on", "turn_off", "toggle"}
+            else domain,
+            service,
+            entity_id,
+        )
+        for entity_id in service_target_entities(hass, domain, service, data)
+    }
 
 
 class NativeFunction(Function):
     def __init__(self) -> None:
         """Initialize native tool."""
-        super().__init__(vol.Schema({vol.Required("name"): str}))
+        super().__init__(
+            vol.Schema(
+                {
+                    vol.Required("name"): vol.In(
+                        {
+                            "execute_service",
+                            "execute_service_single",
+                            "add_automation",
+                            "get_history",
+                            "get_energy",
+                            "get_statistics",
+                            "get_user_from_user_id",
+                        }
+                    )
+                }
+            )
+        )
 
     async def execute(
         self,
@@ -80,35 +199,55 @@ class NativeFunction(Function):
         llm_context: llm.LLMContext | None,
         exposed_entities: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        domain = service_argument["domain"]
-        service = service_argument["service"]
-        service_data = service_argument.get(
-            "service_data", service_argument.get("data", {})
-        )
-        entity_id = service_data.get("entity_id", service_argument.get("entity_id"))
-        area_id = service_data.get("area_id")
-        device_id = service_data.get("device_id")
-
-        if isinstance(entity_id, str):
-            entity_id = [e.strip() for e in entity_id.split(",")]
-        service_data["entity_id"] = entity_id
-
-        if entity_id is None and area_id is None and device_id is None:
-            raise CallServiceError(domain, service, service_data)
-        if not hass.services.has_service(domain, service):
-            raise ServiceNotFound(domain, service)
-        self.validate_entity_ids(hass, entity_id or [], exposed_entities)
-
+        started = False
         try:
-            await hass.services.async_call(
-                domain=domain,
-                service=service,
-                service_data=service_data,
+            domain, service, service_data = service_call_arguments(service_argument)
+            selection = target.TargetSelection(service_data)
+            if not selection.has_any_target:
+                raise CallServiceError(domain, service, {})
+            if "all" in selection.entity_ids:
+                raise EntityNotExposed("all")
+            if not hass.services.has_service(domain, service):
+                raise ServiceNotFound(domain, service)
+
+            # Validate direct IDs and every expanded group/area/device target.
+            # Preserve service-specific target fields and HA's dispatch semantics.
+            self.validate_entity_ids(hass, list(selection.entity_ids), exposed_entities)
+            all_entities = service_target_entities(hass, domain, service, service_data)
+            registered_service = hass.services.async_services()[domain][service]
+            if not all_entities:
+                raise EntityNotFound("target")
+            self.validate_entity_ids(hass, list(all_entities), exposed_entities)
+            # HA validates again at dispatch. This preflight keeps schema failures
+            # distinguishable from exceptions raised after the handler starts.
+            schema = registered_service.schema
+            if schema is not None:
+                schema(deepcopy(service_data))
+            started = True
+            async with asyncio.timeout(_SERVICE_CALL_TIMEOUT):
+                await hass.services.async_call(
+                    domain=domain,
+                    service=service,
+                    service_data=service_data,
+                    blocking=True,
+                    context=llm_context.context if llm_context else None,
+                )
+            return {
+                "success": True,
+                "execution_status": "service_completed",
+                "device_state_confirmed": False,
+            }
+        except EXPECTED_TOOL_ERRORS as err:
+            if is_fatal_error(err) or hass.is_stopping:
+                raise
+            _LOGGER.warning(
+                "HA service call failed (%s, dispatched=%s)",
+                type(err).__name__,
+                started,
             )
-            return {"success": True}
-        except HomeAssistantError as e:
-            _LOGGER.error(e)
-            return {"error": str(e)}
+            return execution_error(
+                err, status="unknown" if started else "not_executed"
+            ).data
 
     async def execute_service(
         self,
@@ -117,18 +256,64 @@ class NativeFunction(Function):
         arguments: dict[str, Any],
         llm_context: llm.LLMContext | None,
         exposed_entities: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
+    ) -> list[dict[str, Any]] | llm.ToolResult:
         result = []
-        for service_argument in arguments.get("list", []):
-            result.append(
-                await self.execute_service_single(
+        try:
+            service_arguments = vol.Schema(vol.All([dict], vol.Length(min=1)))(
+                arguments["list"]
+            )
+        except (KeyError, vol.Invalid) as err:
+            return execution_error(err, status="not_executed")
+        unconfirmed: set[tuple[str, ...]] = set()
+        for service_argument in service_arguments:
+            try:
+                scope = service_operation_keys(hass, service_argument)
+            except EXPECTED_TOOL_ERRORS as err:
+                if is_fatal_error(err) or hass.is_stopping:
+                    raise
+                scope = set()  # The executor will return the actual input error.
+            if scope & unconfirmed:
+                item = {
+                    "error": "UnsafeRetryBlocked",
+                    "error_text": UNCONFIRMED_OPERATION_MESSAGE,
+                    "execution_status": "not_executed",
+                    "retryable": False,
+                    "requires_state_check": True,
+                }
+            else:
+                item = await self.execute_service_single(
                     hass,
                     function_config,
                     service_argument,
                     llm_context,
                     exposed_entities,
                 )
+            result.append(item)
+            if item.get("execution_status") in {"unknown", "partial"}:
+                unconfirmed.update(scope)
+        if any("error" in item for item in result):
+            partial = any(item.get("success") for item in result)
+            status = (
+                "partial"
+                if partial
+                else (
+                    "unknown"
+                    if any(item.get("execution_status") == "unknown" for item in result)
+                    else "not_executed"
+                )
             )
+            failure_data: dict[str, Any] = {
+                "error": "ServiceBatchFailed",
+                "results": result,
+                "execution_status": status,
+                "retryable": status == "not_executed"
+                and not any(item.get("permission_denied") for item in result),
+                "permission_denied": any(
+                    item.get("permission_denied") for item in result
+                ),
+                "requires_state_check": status in {"partial", "unknown"},
+            }
+            return llm.ToolResult(data=failure_data, error=True)
         return result
 
     async def add_automation(
@@ -138,37 +323,76 @@ class NativeFunction(Function):
         arguments: dict[str, Any],
         llm_context: llm.LLMContext | None,
         exposed_entities: list[dict[str, Any]],
-    ) -> str:
-        automation_config = yaml.safe_load(arguments["automation_config"])
-        config = {"id": str(round(time.time() * 1000))}
-        if isinstance(automation_config, list):
-            config.update(automation_config[0])
-        if isinstance(automation_config, dict):
-            config.update(automation_config)
+    ) -> str | llm.ToolResult:
+        write_started = False
+        try:
+            automation_config = yaml.safe_load(arguments["automation_config"])
+            if isinstance(automation_config, list):
+                automation_config = vol.Schema(vol.All([dict], vol.Length(min=1)))(
+                    automation_config
+                )[0]
+            automation_config = vol.Schema(dict)(automation_config)
+            config = {"id": str(round(time.time() * 1000)), **automation_config}
+            await automation.config._async_validate_config_item(
+                hass, config, True, False
+            )
 
-        await automation.config._async_validate_config_item(hass, config, True, False)
+            def append_automation() -> str:
+                nonlocal write_started
+                path = os.path.join(hass.config.config_dir, AUTOMATION_CONFIG_PATH)
+                try:
+                    with open(path, encoding="utf-8") as current_file:
+                        try:
+                            current_automations = (
+                                yaml.safe_load(current_file.read()) or []
+                            )
+                        except yaml.YAMLError as err:
+                            raise InvalidFunction("automation storage") from err
+                except FileNotFoundError:
+                    current_automations = []
+                if not isinstance(current_automations, list):
+                    raise InvalidFunction("automation storage")
+                if any(
+                    isinstance(item, dict) and str(item.get("id")) == str(config["id"])
+                    for item in current_automations
+                ):
+                    raise vol.Invalid("Automation ID already exists")
+                raw_config = yaml.dump([config], allow_unicode=True, sort_keys=False)
+                write_started = True
+                with open(
+                    path, "a" if current_automations else "w", encoding="utf-8"
+                ) as output:
+                    output.write("\n" + raw_config)
+                return raw_config
 
-        automations = [config]
-        with open(
-            os.path.join(hass.config.config_dir, AUTOMATION_CONFIG_PATH),
-            encoding="utf-8",
-        ) as f:
-            current_automations = yaml.safe_load(f.read())
+            def store_automation() -> str:
+                with _AUTOMATION_STORAGE_LOCK:
+                    return append_automation()
 
-        with open(
-            os.path.join(hass.config.config_dir, AUTOMATION_CONFIG_PATH),
-            "a" if current_automations else "w",
-            encoding="utf-8",
-        ) as f:
-            raw_config = yaml.dump(automations, allow_unicode=True, sort_keys=False)
-            f.write("\n" + raw_config)
-
-        await hass.services.async_call(automation.config.DOMAIN, SERVICE_RELOAD)
-        hass.bus.async_fire(
-            EVENT_AUTOMATION_REGISTERED,
-            {"automation_config": config, "raw_config": raw_config},
-        )
-        return "Success"
+            raw_config = await hass.async_add_executor_job(store_automation)
+            async with asyncio.timeout(_SERVICE_CALL_TIMEOUT):
+                await hass.services.async_call(
+                    automation.config.DOMAIN,
+                    SERVICE_RELOAD,
+                    blocking=True,
+                    context=llm_context.context if llm_context else None,
+                )
+            hass.bus.async_fire(
+                EVENT_AUTOMATION_REGISTERED,
+                {"automation_config": config, "raw_config": raw_config},
+            )
+            return "Success"
+        except EXPECTED_TOOL_ERRORS as err:
+            if is_fatal_error(err) or hass.is_stopping:
+                raise
+            _LOGGER.warning(
+                "Automation creation failed (%s, write_started=%s)",
+                type(err).__name__,
+                write_started,
+            )
+            return execution_error(
+                err, status="unknown" if write_started else "not_executed"
+            )
 
     async def get_history(
         self,
