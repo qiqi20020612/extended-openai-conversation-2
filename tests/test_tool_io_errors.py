@@ -16,6 +16,19 @@ from tests.test_tool_argument_retry import _answer, _calls, _results, _tool
 from tests.test_tool_execution import actual_entity, assert_paired, tool_config
 
 
+def integration_diagnostics(caplog):
+    """Check our diagnostics separately from HA's normal payload DEBUG logs.
+
+    PHCC enables HA DEBUG logging, including raw requests in ChatLog and normal
+    REST responses. The error boundary does not change those core loggers.
+    """
+    return "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("custom_components.extended_openai_conversation")
+    )
+
+
 def http_transport(monkeypatch, replies):
     requests = []
 
@@ -143,7 +156,7 @@ async def test_result_template_failure_is_a_tool_error_and_post_cannot_replay(
     first = _results(log)[0].result
     assert first.error and first.data["execution_status"] == "unknown"
     assert _results(log)[1].result == first
-    assert "private-token" not in str(first) + caplog.text
+    assert "private-token" not in str(first) + integration_diagnostics(caplog)
     assert_paired(log, create)
 
 
@@ -346,7 +359,9 @@ async def test_sqlite_missing_table_is_feedback_and_empty_single_result_is_valid
     assert _results(log)[0].result.error
     assert _results(log)[0].result.data["error"] == "OperationalError"
     assert _results(log)[1].result.data == {"result": "{}"}
-    assert "SELECT private_password" not in caplog.text
+    assert "SELECT private_password" not in str(
+        _results(log)[0].result
+    ) + integration_diagnostics(caplog)
     assert_paired(log, create)
 
 

@@ -1,6 +1,7 @@
 """Tests for model parameter selection and unsupported-parameter fallback."""
 
 import json
+from typing import Any
 
 import httpx2
 from openai import AsyncOpenAI, BadRequestError
@@ -25,6 +26,18 @@ MAX_TOKENS_REJECTED = {
         "code": "unsupported_parameter",
     }
 }
+
+# Verbatim error body OpenAI returned for gpt-6.1-sol with tools (issue #22)
+REASONING_EFFORT_WITH_TOOLS_REJECTED = {
+    "error": {
+        "message": "Function tools with reasoning_effort are not supported for gpt-6.1-sol in /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to 'none'.",
+        "type": "invalid_request_error",
+        "param": "reasoning_effort",
+        "code": None,
+    }
+}
+
+TOOLS = [{"type": "function", "function": {"name": "f"}}]
 
 COMPLETION = {
     "id": "chatcmpl-1",
@@ -53,17 +66,24 @@ def _rejection(param: str, code: str = "unsupported_parameter") -> dict:
 
 
 class FakeOpenAI:
-    """Fake OpenAI server that rejects a fixed set of request parameters."""
+    """Fake OpenAI server that rejects a fixed set of request parameters.
 
-    def __init__(self, rejected: dict[str, dict]) -> None:
+    A parameter listed in accepted is only rejected when sent with a
+    different value.
+    """
+
+    def __init__(
+        self, rejected: dict[str, dict], accepted: dict[str, Any] | None = None
+    ) -> None:
         self.rejected = rejected
+        self.accepted = accepted or {}
         self.requests: list[dict] = []
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         body = json.loads(request.content)
         self.requests.append(body)
         for param, error in self.rejected.items():
-            if param in body:
+            if param in body and body[param] != self.accepted.get(param, object()):
                 return httpx2.Response(400, json=error)
         return httpx2.Response(200, json=COMPLETION)
 
@@ -238,7 +258,102 @@ async def test_rejected_param_outside_allowlist_is_not_dropped():
         await async_create_chat_completion(
             server.client(),
             set(),
-            **_kwargs(tools=[{"type": "function", "function": {"name": "f"}}]),
+            **_kwargs(tools=TOOLS),
         )
 
     assert len(server.requests) == 1
+
+
+async def test_reasoning_effort_rejected_with_tools_retries_with_none():
+    server = FakeOpenAI(
+        {"reasoning_effort": REASONING_EFFORT_WITH_TOOLS_REJECTED},
+        accepted={"reasoning_effort": "none"},
+    )
+    unsupported: set[str] = set()
+
+    response = await async_create_chat_completion(
+        server.client(), unsupported, **_kwargs(reasoning_effort="low", tools=TOOLS)
+    )
+
+    assert response.choices[0].message.content == "ok"
+    assert len(server.requests) == 2
+    assert server.requests[1]["reasoning_effort"] == "none"
+    assert server.requests[1]["tools"] == TOOLS
+
+
+async def test_reasoning_effort_with_tools_rejection_is_remembered():
+    server = FakeOpenAI(
+        {"reasoning_effort": REASONING_EFFORT_WITH_TOOLS_REJECTED},
+        accepted={"reasoning_effort": "none"},
+    )
+    unsupported: set[str] = set()
+    client = server.client()
+
+    await async_create_chat_completion(
+        client, unsupported, **_kwargs(reasoning_effort="low", tools=TOOLS)
+    )
+    await async_create_chat_completion(
+        client, unsupported, **_kwargs(reasoning_effort="low", tools=TOOLS)
+    )
+
+    assert len(server.requests) == 3
+    assert server.requests[2]["reasoning_effort"] == "none"
+
+
+async def test_reasoning_effort_kept_without_tools_after_tools_rejection():
+    server = FakeOpenAI(
+        {"reasoning_effort": REASONING_EFFORT_WITH_TOOLS_REJECTED},
+        accepted={"reasoning_effort": "none"},
+    )
+    unsupported: set[str] = set()
+    client = server.client()
+
+    await async_create_chat_completion(
+        client, unsupported, **_kwargs(reasoning_effort="low", tools=TOOLS)
+    )
+    server.rejected = {}
+    await async_create_chat_completion(
+        client, unsupported, **_kwargs(reasoning_effort="high")
+    )
+
+    assert server.requests[-1]["reasoning_effort"] == "high"
+
+
+async def test_reasoning_effort_none_rejected_with_tools_is_raised():
+    server = FakeOpenAI({"reasoning_effort": REASONING_EFFORT_WITH_TOOLS_REJECTED})
+
+    with pytest.raises(BadRequestError):
+        await async_create_chat_completion(
+            server.client(), set(), **_kwargs(reasoning_effort="none", tools=TOOLS)
+        )
+
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("none_supported", [False, True])
+async def test_reasoning_with_tools_fallback_is_bounded_and_redacts_diagnostics(
+    caplog, none_supported
+):
+    rejection = {
+        "error": {
+            **REASONING_EFFORT_WITH_TOOLS_REJECTED["error"],
+            "message": "private-token private-prompt https://private.invalid/",
+        }
+    }
+    server = FakeOpenAI(
+        {"reasoning_effort": rejection},
+        accepted={"reasoning_effort": "none"} if none_supported else {},
+    )
+    client = server.client()
+    kwargs = _kwargs(model="private-model", reasoning_effort="low", tools=TOOLS)
+
+    if none_supported:
+        await async_create_chat_completion(client, set(), **kwargs)
+    else:
+        with pytest.raises(BadRequestError):
+            await async_create_chat_completion(client, set(), **kwargs)
+
+    assert len(server.requests) == 2
+    assert server.requests[-1]["reasoning_effort"] == "none"
+    assert "retrying with 'none'" in caplog.text
+    assert "private-" not in caplog.text

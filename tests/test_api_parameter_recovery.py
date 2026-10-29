@@ -20,25 +20,28 @@ from tests.test_tool_argument_retry import (
 )
 
 
-def rejected(param):
+def rejected(param, code="unsupported_parameter"):
     return BadRequestError(
         "private-token",
         response=httpx2.Response(
             400, request=httpx2.Request("POST", "https://example.invalid")
         ),
-        body={"param": param, "code": "unsupported_parameter"},
+        body={"param": param, "code": code},
     )
 
 
+@pytest.mark.parametrize("param", ["max_completion_tokens", "reasoning_effort"])
 async def test_parameter_fallback_keeps_parser_feedback_success_reuse_and_shared_limit(
-    hass,
+    hass, param
 ):
     entity, log, create = _setup(
         hass,
         [
             _calls(_tool('{"value":1}', call_id="success")),
             _calls(_tool("{", call_id="invalid")),
-            rejected("max_completion_tokens"),
+            rejected(
+                param, None if param == "reasoning_effort" else "unsupported_parameter"
+            ),
             _calls(
                 _tool('{"value":1}', call_id="replayed_success"),
                 _tool('{"value":2}', index=1, call_id="corrected"),
@@ -58,9 +61,18 @@ async def test_parameter_fallback_keeps_parser_feedback_success_reuse_and_shared
     assert first_retry["messages"] == accepted_retry["messages"]
     assert first_retry["messages"][-1]["role"] == "tool"
     assert first_retry["messages"][-1]["tool_call_id"] == "invalid"
-    assert "max_completion_tokens" in first_retry
-    assert "max_completion_tokens" not in accepted_retry
-    assert accepted_retry["max_tokens"] == first_retry["max_completion_tokens"]
+    if param == "reasoning_effort":
+        assert first_retry[param] == "low"
+        assert accepted_retry[param] == "none"
+        assert create.await_args.kwargs[param] == "none"
+        assert (
+            accepted_retry["max_completion_tokens"]
+            == first_retry["max_completion_tokens"]
+        )
+    else:
+        assert "max_completion_tokens" in first_retry
+        assert "max_completion_tokens" not in accepted_retry
+        assert accepted_retry["max_tokens"] == first_retry["max_completion_tokens"]
     assert create.await_args.kwargs["tool_choice"] == "none"
     assert _results(log)[0].result == _results(log)[1].result
     assert len(_results(log)) == 3
@@ -70,8 +82,15 @@ async def test_parameter_fallback_keeps_parser_feedback_success_reuse_and_shared
         _assert_paired_tools(request.kwargs["messages"])
 
 
-@pytest.mark.parametrize("use_tools", [False, True])
-async def test_parameter_fallback_does_not_buffer_text(hass, use_tools):
+@pytest.mark.parametrize(
+    ("use_tools", "param"),
+    [
+        (False, "max_completion_tokens"),
+        (True, "max_completion_tokens"),
+        (True, "reasoning_effort"),
+    ],
+)
+async def test_parameter_fallback_does_not_buffer_text(hass, use_tools, param):
     class LiveStream(_Stream):
         async def __aiter__(self):
             for index, token in enumerate(["Live ", "text"]):
@@ -81,14 +100,23 @@ async def test_parameter_fallback_does_not_buffer_text(hass, use_tools):
             yield _chunk(finish="stop")
 
     stream = LiveStream()
-    entity, log, create = _setup(hass, [rejected("max_completion_tokens"), stream])
+    entity, log, create = _setup(
+        hass,
+        [
+            rejected(
+                param, None if param == "reasoning_effort" else "unsupported_parameter"
+            ),
+            stream,
+        ],
+    )
 
     await entity._async_handle_chat_log(log, TOOLS if use_tools else [], [])
 
     assert create.await_count == 2
     entity._execute_function_tool.assert_not_awaited()
     assert log.content[-1].content == "Live text"
-    assert entity._unsupported_params == {"gpt-5-mini": {"max_completion_tokens"}}
+    remembered = "reasoning_effort+tools" if param == "reasoning_effort" else param
+    assert entity._unsupported_params == {"gpt-5-mini": {remembered}}
     stream.close.assert_awaited_once()
 
 
